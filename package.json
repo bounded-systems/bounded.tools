@@ -1,0 +1,14 @@
+{
+  "name": "bounded.tools",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub App receiver + setup endpoint for prx (bounded-systems-prx).",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
