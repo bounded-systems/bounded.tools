@@ -3,8 +3,12 @@
     "type": "name",
     "value": "Bounded Tools"
   },
+  "tagline": {
+    "type": "tagline",
+    "value": "The GitHub App receiver + setup endpoint for prx — backs the org-owned GitHub App bounded-systems-prx (installation 1…"
+  },
   "description": {
     "type": "meta",
-    "value": "GitHub App receiver + setup endpoint for prx (bounded-systems-prx)."
+    "value": "The GitHub App receiver + setup endpoint for prx — backs the org-owned GitHub App bounded-systems-prx (installation 138039680).  Lives in its own repo by design; prx owns the app definition (. github/prx-app."
   }
 }
