@@ -6,7 +6,9 @@
   "description": "GitHub App receiver + setup endpoint for prx (bounded-systems-prx).",
   "scripts": {
     "dev": "bun --watch src/server.ts",
-    "start": "bun src/server.ts"
+    "start": "bun src/server.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest"

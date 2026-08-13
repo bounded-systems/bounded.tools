@@ -1,0 +1,22 @@
+name: standard
+# The org's shared test/security lane. Added with the CI-aggregator core
+# (.github-private#481): this repo had no lane that ran anything, so a test file
+# here would have been decoration — green by never being executed. Adding the
+# tests and the gate that runs them in the same change is the point; a check
+# nothing runs is the failure mode claude-box#252 just cost five days to.
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  standard:
+    uses: bounded-systems/.github/.github/workflows/repo-standard.yml@d43c3280588ef05f4ead43426db1091d4cb8f520
+    with:
+      security: true
+      test: true
+      runtime: bun
+      # `bun install` first: tsc resolves `types: ["bun"]` from @types/bun, and
+      # without the install it fails with TS2688 rather than any real type error.
+      test-command: "bun install --frozen-lockfile && bun test && bun x tsc --noEmit"
