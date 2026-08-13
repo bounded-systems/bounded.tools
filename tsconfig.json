@@ -4,7 +4,9 @@
     "module": "esnext",
     "target": "esnext",
     "moduleResolution": "bundler",
-    "types": ["bun"],
+    // Both: `bun test` runs the pure modules under Bun, while the Worker entry
+    // and the Durable Object need the Workers globals.
+    "types": ["bun", "@cloudflare/workers-types"],
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,

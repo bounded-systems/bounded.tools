@@ -6,3 +6,6 @@ dist/
 *.pem
 *.log
 .DS_Store
+
+# wrangler local secrets
+.dev.vars
