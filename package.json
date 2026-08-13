@@ -5,12 +5,15 @@
   "type": "module",
   "description": "GitHub App receiver + setup endpoint for prx (bounded-systems-prx).",
   "scripts": {
-    "dev": "bun --watch src/server.ts",
-    "start": "bun src/server.ts",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:worker": "wrangler deploy --dry-run"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@cloudflare/workers-types": "^5.20260813.1",
+    "@types/bun": "latest",
+    "wrangler": "4.123.0"
   }
 }

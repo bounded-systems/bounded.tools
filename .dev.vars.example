@@ -1,0 +1,12 @@
+# bounded.tools — copy to .dev.vars for `wrangler dev`. NEVER commit .dev.vars.
+#
+# In production these are Worker Secrets (`wrangler secret put <NAME>`), not a
+# file. There is no PORT: this is a Worker, not a long-lived process.
+
+# Verifies inbound App deliveries. ABSENT => every delivery is rejected; the
+# receiver fails closed rather than accepting unauthenticated events.
+GITHUB_WEBHOOK_SECRET=
+
+# Not read yet — for minting installation tokens (JWT -> installation token)
+# when the push side lands (.github-private#481 increment 5).
+GITHUB_APP_ID=

@@ -17,6 +17,11 @@ jobs:
       security: true
       test: true
       runtime: bun
-      # `bun install` first: tsc resolves `types: ["bun"]` from @types/bun, and
-      # without the install it fails with TS2688 rather than any real type error.
-      test-command: "bun install --frozen-lockfile && bun test && bun x tsc --noEmit"
+      # `bun install` first: tsc resolves its `types` from the installed
+      # packages, and without the install it fails with TS2688 rather than any
+      # real type error.
+      #
+      # The wrangler dry-run is the only check that the Worker actually BUILDS —
+      # bun test never loads the entry point, and tsc does not validate
+      # wrangler.jsonc or the Durable Object binding. It needs no credentials.
+      test-command: "bun install --frozen-lockfile && bun test && bun x tsc --noEmit && WRANGLER_SEND_METRICS=false bun x wrangler deploy --dry-run"

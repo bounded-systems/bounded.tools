@@ -1,0 +1,39 @@
+{
+  // bounded.tools — GitHub App receiver + fleet CI snapshot.
+  // Deploy: `npx wrangler deploy`. Validate without deploying: `bun run check:worker`.
+  //
+  // Secret (set with `wrangler secret put`, NEVER here and never in git):
+  //   GITHUB_WEBHOOK_SECRET — verifies inbound App deliveries. Absent ⇒ every
+  //                           delivery is rejected (the receiver fails closed).
+  "name": "bounded-tools",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-06-21",
+  "workers_dev": false,
+  // A receiver holding a webhook secret should not also be reachable at
+  // long-lived preview URLs (same reasoning as cf-oidc-token-broker).
+  "preview_urls": false,
+  "vars": {
+    // Repos the App is installed on, comma-separated — the denominator for the
+    // snapshot's coverage. LEAVE EMPTY rather than guessing: an absent list makes
+    // /ci.json report coverage as unknown, which is honest, whereas a wrong list
+    // makes it claim completeness it does not have. Replaced by the App's live
+    // installation list once the reconcile poll lands (#481 increment 4).
+    "CI_REPOS_KNOWN": ""
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        // One instance, named "fleet". Sharding per repo would reintroduce the
+        // cross-repo race the DO is here to remove — see src/ci-do.ts.
+        "name": "CI_STATE",
+        "class_name": "CiStateDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CiStateDO"]
+    }
+  ]
+}
