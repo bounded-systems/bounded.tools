@@ -14,15 +14,21 @@
 
 import { CiStateDO } from "./ci-do";
 import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
+import { listInstallationRepos } from "./reconcile";
 
 export { CiStateDO };
 
 export type Env = {
   GITHUB_WEBHOOK_SECRET?: string;
-  /** Comma-separated repos the App is installed on, for snapshot coverage.
-   *  Absent ⇒ the snapshot reports coverage as unknown rather than guessing. */
+  /** Manual OVERRIDE of the coverage denominator (comma-separated repos).
+   *  Normally empty: the reconcile cron keeps the real list in the DO. Set it
+   *  only to force a specific denominator while debugging; absent + no
+   *  reconcile yet ⇒ the snapshot reports coverage as unknown. */
   CI_REPOS_KNOWN?: string;
   CI_STATE: DurableObjectNamespace;
+  /** Service binding to cf-token-broker — the reconcile cron's mint path
+   *  (binding.internal/apptoken/bs-door-hooks, metadata:read only). */
+  BROKER: Fetcher;
 };
 
 const enc = new TextEncoder();
@@ -201,5 +207,40 @@ ever holds the PEM.</p></body>`;
     }
 
     return new Response("not found", { status: 404 });
+  },
+
+  // The reconcile cron (.github-private#481 increment 4): refresh the coverage
+  // denominator from the App's live installation list. Failure of any step
+  // leaves the stored list UNTOUCHED — a stale-but-real denominator beats a
+  // partial or empty one, and the DO refuses empty writes independently.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        const mint = await env.BROKER.fetch("https://binding.internal/apptoken/bs-door-hooks", {
+          method: "POST",
+        });
+        if (!mint.ok) {
+          console.error(`[reconcile] broker mint failed: ${mint.status}`);
+          return;
+        }
+        const { token } = (await mint.json()) as { token?: string };
+        if (!token) {
+          console.error("[reconcile] broker returned no token");
+          return;
+        }
+        const repos = await listInstallationRepos(token);
+        const res = await ci(env).fetch("https://ci/reposKnown", {
+          method: "POST",
+          body: JSON.stringify({ repos }),
+        });
+        const body = await res.json();
+        console.log(`[reconcile] repos=${repos.length} stored=${JSON.stringify(body)}`);
+      })().catch((e) => {
+        // Caught and logged rather than thrown: a reconcile failure must show
+        // up in logs and as a stale denominator, never as a crashed cron that
+        // Cloudflare silently retries into the same wall.
+        console.error(`[reconcile] failed: ${e instanceof Error ? e.message : e}`);
+      }),
+    );
   },
 };

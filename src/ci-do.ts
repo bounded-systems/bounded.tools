@@ -24,6 +24,9 @@ import {
 } from "./ci-state";
 
 const STATE_KEY = "ci-state";
+const REPOS_KNOWN_KEY = "repos-known";
+
+type ReposKnownRecord = { repos: string[]; observed_at: string };
 
 export class CiStateDO {
   constructor(private state: DurableObjectState) {}
@@ -48,13 +51,38 @@ export class CiStateDO {
       return Response.json({ stored: after !== before });
     }
 
+    // The reconcile cron's write: the App's installation list, the only honest
+    // coverage denominator. An empty list is REFUSED — writing it would flip
+    // the snapshot from "coverage unknown" to "coverage complete over nothing",
+    // the cheerful-green failure the whole contract exists to prevent; an empty
+    // fetch result means something upstream broke, and unknown is the truthful
+    // report of that.
+    if (url.pathname === "/reposKnown" && request.method === "POST") {
+      const body = (await request.json()) as { repos?: unknown };
+      const repos = Array.isArray(body.repos)
+        ? body.repos.filter((r): r is string => typeof r === "string" && r.length > 0)
+        : [];
+      if (repos.length === 0) {
+        return Response.json({ stored: false, reason: "empty repo list refused" }, { status: 400 });
+      }
+      const record: ReposKnownRecord = { repos, observed_at: new Date().toISOString() };
+      await this.state.storage.put(REPOS_KNOWN_KEY, record);
+      return Response.json({ stored: true, count: repos.length });
+    }
+
     if (url.pathname === "/snapshot" && request.method === "GET") {
-      // `reposKnown` is supplied by the caller (the App's installation list),
-      // not inferred from what has reported in — inferring it would make
-      // coverage look complete exactly when it is worst, because a fleet that
-      // has reported nothing would claim to know of nothing.
+      // `reposKnown` is supplied, never inferred from who has reported in —
+      // inferring it would make coverage look complete exactly when it is
+      // worst, because a fleet that has reported nothing would claim to know
+      // of nothing. Precedence: the caller's explicit query (the CI_REPOS_KNOWN
+      // var, a manual override) wins; otherwise the reconcile cron's stored
+      // installation list; otherwise undefined and coverage reports unknown.
       const raw = url.searchParams.get("reposKnown");
-      const reposKnown = raw ? raw.split(",").filter(Boolean) : undefined;
+      let reposKnown = raw ? raw.split(",").filter(Boolean) : undefined;
+      if (!reposKnown) {
+        const rec = await this.state.storage.get<ReposKnownRecord>(REPOS_KNOWN_KEY);
+        reposKnown = rec?.repos;
+      }
       const state = await this.load();
       return Response.json(toSnapshot(state, { now: new Date(), reposKnown }));
     }

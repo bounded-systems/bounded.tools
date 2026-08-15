@@ -54,11 +54,19 @@ suppresses the checks that would have disagreed:
   snapshot with this false has not seen the fleet and must not render as
   "all green"; `unobserved` names the repos it has never heard from.
 
-Not wired yet (tracked in `.github-private#481`): the reconcile poll that
-catches repos which emit no events, and two blocking App-settings changes —
-`workflow_run` in `default_events` and `actions: read` in `default_permissions`.
-Without the first, the receiver never sees the `startup_failure` class that let
-claude-box#254 sit dead for two months.
+The coverage denominator comes from the **reconcile cron** (hourly): a
+broker-minted installation token over the service-binding plane
+(`binding.internal/apptoken/bs-door-hooks`, `metadata: read` only) lists the
+App's installed repos into the DO. An empty list is refused at the DO — a
+failed reconcile shows up as a stale denominator, never as "coverage complete
+over nothing". `CI_REPOS_KNOWN` remains as a manual override for debugging.
+The App's `workflow_run` + `actions: read` settings are declared in its
+manifest (infra `github-admin/app-manifests/bs-door-hooks.json`) from birth.
+
+Still not wired (tracked in `.github-private#481`): push-on-transition, and
+using `actions: read` to backfill each repo's latest default-branch run so a
+repo that emits no events still gets a truthful red/green rather than only
+appearing in `unobserved`.
 
 ## Run
 
