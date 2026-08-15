@@ -13,9 +13,12 @@ GitHub App [`bounded-systems-prx`](https://github.com/organizations/bounded-syst
 > nothing answers, and no delivery has ever been handled. Check the App's
 > recent deliveries before assuming any event-driven behaviour has run.
 >
-> The code below is a **Cloudflare Worker** and is deployable
-> (`wrangler deploy`), but deploying it and pointing a route at
-> `bounded.tools/api/*` is a manual step nobody has taken yet.
+> The code below is a **Cloudflare Worker** deployed via `deploy.yml` (OIDC →
+> cf-token-broker mint, human-approved) to its custom domain
+> **`hooks.bounded.tools`** — the sibling precedent of `boot.`/`status.`; apex
+> zone routes would need a zone permission the scripts-only mint does not
+> carry. The App's hook URL moves to `https://hooks.bounded.tools/api/github/webhooks`
+> through the broker's /apphook tier (registry-carried, never hand-edited).
 
 Previously a `Bun.serve` process (`src/server.ts`). Rewritten as a Worker for
 the fleet CI aggregator (`.github-private#481`), which needs a Durable Object

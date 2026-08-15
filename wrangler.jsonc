@@ -15,6 +15,31 @@
   // unexpected.
   "account_id": "a2ca40f474fa65ed8f751a3efdf74c01",
   "workers_dev": false,
+  // hooks.bounded.tools — THE Worker's only hostname, and the fix for deploy run
+  // 31886044499, which minted, deployed, and then failed its own probe with
+  // "deploy exposed no parseable hostname — nothing was verified": workers_dev
+  // is off (deliberately) and no route existed, so the script was live in the
+  // account and served nothing. Exactly the blindness the probe exists to catch.
+  //
+  // A custom DOMAIN, not apex zone routes (bounded.tools/api/*), on the sibling
+  // precedent: boot and status attach custom domains with the same scripts-only
+  // minted token (the domains API is account-level), whereas zone routes need a
+  // zone permission that mint does not carry and would fail the deploy the #131
+  // way. The custom domain is part of the deploy on purpose — the hostname
+  // binding is version-controlled and moves through the same approval-gated
+  // lane as the code (the broker/status/boot rationale, copied).
+  //
+  // CONSEQUENCE, tracked: the prx App's hook_attributes.url points at the apex
+  // path (bounded.tools/api/github/webhooks), which the static site 404s. The
+  // hook URL moves to https://hooks.bounded.tools/api/github/webhooks via the
+  // broker's /apphook tier — the registry carries the URL, the tier PATCHes it
+  // alongside the secret, no hand edit of App settings.
+  "routes": [
+    {
+      "pattern": "hooks.bounded.tools",
+      "custom_domain": true
+    }
+  ],
   // A receiver holding a webhook secret should not also be reachable at
   // long-lived preview URLs (same reasoning as cf-oidc-token-broker).
   "preview_urls": false,
