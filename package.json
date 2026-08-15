@@ -16,5 +16,8 @@
     "@types/bun": "latest",
     "fast-check": "^4.9.0",
     "wrangler": "4.114.0"
+  },
+  "overrides": {
+    "undici": "7.29.0"
   }
 }
