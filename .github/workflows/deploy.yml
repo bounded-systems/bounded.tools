@@ -24,10 +24,21 @@ name: deploy
 #      without its claim. NOT covered by infra's github-admin/environments.tf,
 #      which manages infra's own environments only; this repo owns it, the same
 #      way front-desk-scheduler owns `lease-deploy`.
-#   3. GITHUB_WEBHOOK_SECRET set as a Worker Secret (`wrangler secret put`),
-#      matching the App's webhook secret. The receiver FAILS CLOSED without it
-#      — every delivery is rejected — so a deploy without it serves /ci.json
-#      but ingests nothing, which the probe below cannot detect.
+#   3. For the webhook-secret sync (the step after Deploy): the broker's
+#      /apphook tier live with its `bounded-tools` entry — which itself needs
+#      the prx App's appId filled in the registry and GH_APP_PRX_PRIVATE_KEY
+#      `wrangler secret put` on the BROKER (see the APP_HOOK_CONFIG comment in
+#      infra's broker wrangler.jsonc). Until then the sync step fails loudly;
+#      dispatch with sync_webhook_secret=false to deploy the Worker anyway.
+#
+# THE WEBHOOK SECRET IS AN OIDC ARTIFACT. No human ever holds it: each run
+# with sync enabled generates a fresh value (openssl, masked), writes the
+# Worker half under the same minted token (`wrangler secret put` is a script
+# write — infra's `rotate` precedent), and writes the App half through the
+# broker's /apphook tier, which PATCHes the App's hook config as the App.
+# Rotation is a re-run. The receiver FAILS CLOSED while the halves disagree
+# (every delivery rejected), which a partial failure of this step produces —
+# the step says so and the fix is always: re-run the lane.
 #
 # The Durable Object namespace needs no pre-provisioning step (unlike status's
 # STATUS_KV): `wrangler deploy` creates it from the migrations block. That is
@@ -37,6 +48,14 @@ name: deploy
 
 on:
   workflow_dispatch:
+    inputs:
+      sync_webhook_secret:
+        description: >-
+          Rotate the webhook secret on both sides (Worker Secret + App hook
+          config) after deploying. Disable only to bootstrap the Worker before
+          the broker's /apphook tier is live.
+        type: boolean
+        default: true
 
 permissions:
   id-token: write # OIDC -> broker /deploy/bounded-tools
@@ -150,6 +169,56 @@ jobs:
           echo "custom_domain=$custom" >> "$GITHUB_OUTPUT"
           [ -n "$url" ] && echo "workers.dev: $url" || echo "no workers.dev URL in this deploy (workers_dev is false)"
           [ -n "$custom" ] && echo "custom domain: $custom" || echo "no custom domain in this deploy"
+
+      # The webhook secret, as an OIDC artifact — generated here, never seen by
+      # anyone, both halves written by machinery. Worker half FIRST: if the App
+      # half then fails, deliveries are signed with the old secret against a
+      # Worker holding the new one — rejected, fail closed — and the run FAILS
+      # naming the one fix (re-run). The reverse order has the same window; what
+      # matters is that a partial failure is loud and converges on re-run.
+      - name: Sync webhook secret (OIDC artifact — nobody holds it)
+        if: ${{ inputs.sync_webhook_secret }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          CF_BROKER_URL: ${{ vars.CF_BROKER_URL }}
+          APPHOOK_AUDIENCE: app-hook-broker
+        run: |
+          set -euo pipefail
+          secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$secret"
+
+          # Worker half — a script-settings write under the SAME minted token
+          # (infra's `rotate` precedent: a secret put IS a deploy).
+          printf '%s' "$secret" | bun x wrangler secret put GITHUB_WEBHOOK_SECRET
+
+          # App half — the broker PATCHes the App's hook config as the App.
+          jwt="$(curl -sf "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${APPHOOK_AUDIENCE}" \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value // empty')"
+          [ -n "$jwt" ] || { echo "::error::could not obtain an OIDC token for ${APPHOOK_AUDIENCE}"; exit 1; }
+
+          body="$(curl -sf -X POST "${CF_BROKER_URL%/}/apphook/bounded-tools" \
+            -H "Authorization: Bearer $jwt" -H "content-type: application/json" \
+            -d "{\"secret\":\"$secret\"}")" || {
+            echo "::error::broker refused the App-side secret write. THE HALVES NOW DISAGREE:"
+            echo "::error::the Worker holds a new secret, the App still signs with the old one,"
+            echo "::error::so every delivery is rejected (fail closed) until a re-run converges them."
+            echo "::error::  401 = audience/workflow-ref/owner pin rejected"
+            echo "::error::  404 = APP_HOOK_CONFIG has no live bounded-tools entry — merge the infra"
+            echo "::error::        registry AND redeploy the broker (broker-deploy.yml)"
+            echo "::error::  500 = appId unfilled or GH_APP_PRX_PRIVATE_KEY not set on the broker"
+            echo "::error::        (bootstrap steps in infra's APP_HOOK_CONFIG comment)"
+            echo "::error::  502 = GitHub refused the hook-config PATCH"
+            exit 1
+          }
+          hook_url="$(jq -r '.hook_url // "?"' <<<"$body")"
+          echo "✓ webhook secret rotated on both sides (App hook: $hook_url)"
+
+      - name: Note the skipped secret sync
+        if: ${{ !inputs.sync_webhook_secret }}
+        run: |
+          echo "::warning::sync_webhook_secret=false — the Worker may hold no (or a stale)"
+          echo "::warning::GITHUB_WEBHOOK_SECRET. The receiver fails closed: /ci.json serves,"
+          echo "::warning::but every delivery is rejected until a run with the sync enabled."
 
       # Not "does something answer" — the static site answers today, with a
       # 404, which is exactly how this Worker's absence went unnoticed. So probe

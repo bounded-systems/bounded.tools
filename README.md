@@ -72,7 +72,10 @@ and never committed.
 
 - `GITHUB_WEBHOOK_SECRET` *(secret)* — verifies inbound deliveries. **Absent ⇒
   every delivery is rejected**; the receiver fails closed rather than accepting
-  unauthenticated events.
+  unauthenticated events. **Nobody holds this value**: the deploy lane
+  (`deploy.yml`) generates it per run and writes both halves — the Worker
+  Secret under its broker-minted token, and the App's hook config through the
+  broker's `/apphook/bounded-tools` tier. Rotation is a re-run of the lane.
 - `CI_REPOS_KNOWN` *(var)* — comma-separated repos the App is installed on, the
   denominator for snapshot coverage. Leave empty rather than guessing: empty
   reports coverage as *unknown*, which is honest; a wrong list claims
