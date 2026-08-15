@@ -156,6 +156,14 @@ jobs:
           # The repo's own pinned wrangler, not a floating npx version: the
           # dry-run tripwire above and this deploy then run the SAME wrangler,
           # so "it bundled in CI" and "it bundled at deploy" cannot disagree.
+          #
+          # THE PIN IS 4.114.0 AND THE VALUE IS LOAD-BEARING (run 31886866958):
+          # 4.123.0 attaches a custom domain by first querying
+          # /zones/{id}/workers/routes, which the scripts-only minted token
+          # 401s (code 10000) — the account-level domains API alone is what
+          # the mint can reach, and 4.114.0 (the version boot/status deploy
+          # with) uses only that. Bump the pin only after proving the new
+          # version's custom-domain path against a real mint.
           bun x wrangler deploy | tee /tmp/wrangler-deploy.log
           # Strip ANSI first — wrangler colourises, and a colour code inside a
           # hostname silently breaks the match.
