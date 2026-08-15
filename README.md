@@ -6,19 +6,21 @@ GitHub App [`bounded-systems-prx`](https://github.com/organizations/bounded-syst
 [app definition](https://github.com/bounded-systems/prx/blob/main/docs/github-app.md)
 (`.github/prx-app.manifest.json`), this repo owns the runtime.
 
-> **Status: NOT DEPLOYED.** Measured 2026-08-13: `GET /health` and `GET /setup`
-> both return the static site's HTML 404, and the repo carried no deployment
-> config of any kind — so the App's `hook_attributes.url`
-> (`https://bounded.tools/api/github/webhooks`) has been pointing at a path
-> nothing answers, and no delivery has ever been handled. Check the App's
-> recent deliveries before assuming any event-driven behaviour has run.
+> **Status: DEPLOYED, not yet ingesting.** First light 2026-08-15 (run
+> 31889379320): `GET https://hooks.bounded.tools/health` returns `ok` and
+> `/ci.json` serves a valid snapshot. The receiver still **rejects every
+> delivery** (fails closed, by design) until a deploy runs with
+> `sync_webhook_secret=true` — which generates the secret as an OIDC artifact,
+> writes the Worker half under its minted token, and PATCHes the App's hook
+> config (secret + URL re-aim to `https://hooks.bounded.tools/api/github/webhooks`)
+> through the broker's `/apphook/bounded-tools` tier. Until then the App's
+> `hook_attributes.url` still points at the apex path the static site 404s.
 >
-> The code below is a **Cloudflare Worker** deployed via `deploy.yml` (OIDC →
-> cf-token-broker mint, human-approved) to its custom domain
-> **`hooks.bounded.tools`** — the sibling precedent of `boot.`/`status.`; apex
-> zone routes would need a zone permission the scripts-only mint does not
-> carry. The App's hook URL moves to `https://hooks.bounded.tools/api/github/webhooks`
-> through the broker's /apphook tier (registry-carried, never hand-edited).
+> The Worker deploys via `deploy.yml` (OIDC → cf-token-broker mint,
+> human-approved) to its custom domain **`hooks.bounded.tools`** — the sibling
+> precedent of `boot.`/`status.`; apex zone routes would need a zone permission
+> beyond what the mint carries (first-time custom-domain attach already needed
+> the broker's zone-scoped `domains` read family, infra#311).
 
 Previously a `Bun.serve` process (`src/server.ts`). Rewritten as a Worker for
 the fleet CI aggregator (`.github-private#481`), which needs a Durable Object

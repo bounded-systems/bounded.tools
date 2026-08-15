@@ -157,13 +157,15 @@ jobs:
           # dry-run tripwire above and this deploy then run the SAME wrangler,
           # so "it bundled in CI" and "it bundled at deploy" cannot disagree.
           #
-          # THE PIN IS 4.114.0 AND THE VALUE IS LOAD-BEARING (run 31886866958):
-          # 4.123.0 attaches a custom domain by first querying
-          # /zones/{id}/workers/routes, which the scripts-only minted token
-          # 401s (code 10000) — the account-level domains API alone is what
-          # the mint can reach, and 4.114.0 (the version boot/status deploy
-          # with) uses only that. Bump the pin only after proving the new
-          # version's custom-domain path against a real mint.
+          # THE PIN IS 4.114.0 — the version boot/status deploy with, so the
+          # sibling lanes share one proven wrangler. (Run 31886866958 blamed
+          # 4.123.0 for the zone-routes 401 on custom-domain attach; run
+          # 31887176578 REFUTED that — 4.114.0 preflights the same
+          # /zones/{id}/workers/routes endpoint on a FIRST attach. The real
+          # fix is the broker's zone-scoped `domains` read family, infra#311.
+          # Redeploys of an already-attached domain never touch the zone,
+          # which is why the siblings appeared to prove the version theory.)
+          # Bump the pin only with the dry-run tripwire green.
           bun x wrangler deploy | tee /tmp/wrangler-deploy.log
           # Strip ANSI first — wrangler colourises, and a colour code inside a
           # hostname silently breaks the match.
@@ -254,9 +256,23 @@ jobs:
             # answers 404 with HTML, so this distinguishes "the Worker is
             # serving" from "something is serving" — the exact confusion that
             # let a never-deployed receiver look fine for months.
-            health="$(curl -sS --max-time 20 "$base/health")"
-            [ "$health" = "ok" ] || { echo "::error::$base/health returned '${health:0:120}' (want 'ok')"; exit 1; }
-            echo "  ✓ /health"
+            #
+            # Retried, because the FIRST attach of a custom domain is not
+            # instantly resolvable: run 31889379320 deployed and attached
+            # successfully, then died here 0.2s later on curl exit 6 (could
+            # not resolve host) — the identical probe passed minutes later.
+            # Bounded retries absorb DNS/edge propagation; the final state is
+            # still asserted strictly, so a Worker that never comes up (or
+            # serves the wrong body) fails the run exactly as before.
+            health=""
+            for attempt in $(seq 1 12); do
+              health="$(curl -sS --max-time 20 "$base/health" 2>/tmp/health-err || true)"
+              [ "$health" = "ok" ] && break
+              echo "  … attempt $attempt: not serving yet ($(head -c 120 /tmp/health-err)${health:+body: ${health:0:80}}) — retrying in 15s"
+              sleep 15
+            done
+            [ "$health" = "ok" ] || { echo "::error::$base/health returned '${health:0:120}' (want 'ok') after $attempt attempts"; exit 1; }
+            echo "  ✓ /health (attempt $attempt)"
 
             # /ci.json: valid JSON carrying the contract's two mandatory fields.
             snap="$(curl -sS --max-time 20 "$base/ci.json")"
