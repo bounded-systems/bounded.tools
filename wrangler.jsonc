@@ -44,13 +44,30 @@
   // long-lived preview URLs (same reasoning as cf-oidc-token-broker).
   "preview_urls": false,
   "vars": {
-    // Repos the App is installed on, comma-separated — the denominator for the
-    // snapshot's coverage. LEAVE EMPTY rather than guessing: an absent list makes
-    // /ci.json report coverage as unknown, which is honest, whereas a wrong list
-    // makes it claim completeness it does not have. Replaced by the App's live
-    // installation list once the reconcile poll lands (#481 increment 4).
+    // Manual OVERRIDE of the coverage denominator, comma-separated. Normally
+    // EMPTY: the reconcile cron below keeps the real list (the App's live
+    // installation list) in the DO. Setting this forces a specific denominator
+    // for debugging; a wrong list claims completeness it does not have.
     "CI_REPOS_KNOWN": ""
   },
+  // The reconcile cron (#481 increment 4): hourly, refresh the coverage
+  // denominator via the broker's service-binding plane. Off-minute on purpose —
+  // the same schedule-spreading habit as the org's other hourly lanes.
+  "triggers": {
+    "crons": ["43 * * * *"]
+  },
+  // The mint path for that cron: bounded-tools → cf-token-broker over a service
+  // binding (binding.internal/apptoken/bs-door-hooks, downscoped to
+  // metadata:read in the broker's APP_BINDING_CONFIG). A binding, not a public
+  // call: the broker's binding plane is host-gated to traffic that can only
+  // originate from same-account Workers, and THIS declaration — landing through
+  // the approval-gated deploy lane — is the grant.
+  "services": [
+    {
+      "binding": "BROKER",
+      "service": "cf-token-broker"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
