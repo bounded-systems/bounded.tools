@@ -8,6 +8,12 @@
   "name": "bounded-tools",
   "main": "src/worker.ts",
   "compatibility_date": "2026-06-21",
+  // Same account as every other org Worker (infra/cloudflare/*/wrangler.jsonc).
+  // Pinned here rather than left to the deploy environment because the minted
+  // token is account-scoped: config that names the account explicitly is how a
+  // deploy aimed at the wrong one fails loudly instead of succeeding somewhere
+  // unexpected.
+  "account_id": "a2ca40f474fa65ed8f751a3efdf74c01",
   "workers_dev": false,
   // A receiver holding a webhook secret should not also be reachable at
   // long-lived preview URLs (same reasoning as cf-oidc-token-broker).

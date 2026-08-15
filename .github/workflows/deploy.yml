@@ -1,0 +1,271 @@
+name: deploy
+
+# Deploy the bounded.tools Worker from CI — with NO stored Cloudflare token.
+# Same lane shape as infra's status-deploy.yml / broker-deploy.yml and
+# front-desk-scheduler's lease-deploy.yml: OIDC → the broker's
+# /deploy/bounded-tools tier mints a short-lived Workers Scripts:Edit token, a
+# human approves BEFORE the mint, `wrangler deploy` uses it, then a probe
+# confirms the deployed hostnames actually serve.
+#
+# Cross-repo by design (the `lease` precedent): the Worker's source lives here
+# with its tests, and the broker pins workflowRef exactly, so which FILE may
+# mint does not depend on which repo holds it.
+#
+# What this deploys is the org's GitHub App receiver and the fleet CI snapshot
+# (/ci.json, .github-private#481). Worth stating plainly: until this lane runs
+# successfully, the App's hook_attributes.url points at a path the static site
+# 404s — measured 2026-08-13 — so no delivery has ever been handled.
+#
+# BOOTSTRAP — what must exist before the first run, in order:
+#   1. The `bounded-tools` entry in the broker's WORKERS_DEPLOY registry, live
+#      — merged AND the broker redeployed (infra broker-deploy.yml, approved).
+#      Until then the mint 404s "unknown deploy target": expected, not broken.
+#   2. The `bounded-tools-deploy` Environment ON THIS REPO — the mint 401s
+#      without its claim. NOT covered by infra's github-admin/environments.tf,
+#      which manages infra's own environments only; this repo owns it, the same
+#      way front-desk-scheduler owns `lease-deploy`.
+#   3. For the webhook-secret sync (the step after Deploy): the broker's
+#      /apphook tier live with its `bounded-tools` entry — which itself needs
+#      the prx App's appId filled in the registry and GH_APP_PRX_PRIVATE_KEY
+#      `wrangler secret put` on the BROKER (see the APP_HOOK_CONFIG comment in
+#      infra's broker wrangler.jsonc). Until then the sync step fails loudly;
+#      dispatch with sync_webhook_secret=false to deploy the Worker anyway.
+#
+# THE WEBHOOK SECRET IS AN OIDC ARTIFACT. No human ever holds it: each run
+# with sync enabled generates a fresh value (openssl, masked), writes the
+# Worker half under the same minted token (`wrangler secret put` is a script
+# write — infra's `rotate` precedent), and writes the App half through the
+# broker's /apphook tier, which PATCHes the App's hook config as the App.
+# Rotation is a re-run. The receiver FAILS CLOSED while the halves disagree
+# (every delivery rejected), which a partial failure of this step produces —
+# the step says so and the fix is always: re-run the lane.
+#
+# The Durable Object namespace needs no pre-provisioning step (unlike status's
+# STATUS_KV): `wrangler deploy` creates it from the migrations block. That is
+# also why the registry entry is scripts-only. If a first deploy fails on the
+# migration rather than the script, capture the refusal body verbatim — it is
+# evidence for a new permission family, not a config error to guess at.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_webhook_secret:
+        description: >-
+          Rotate the webhook secret on both sides (Worker Secret + App hook
+          config) after deploying. Disable only to bootstrap the Worker before
+          the broker's /apphook tier is live.
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write # OIDC -> broker /deploy/bounded-tools
+  issues: write # manual-approval opens/updates the approval issue
+
+# One deploy at a time; never cancel a deploy already in flight.
+concurrency:
+  group: bounded-tools-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: bounded-tools-deploy
+    timeout-minutes: 60 # bound a forgotten approval rather than hanging a runner
+    steps:
+      - name: Refuse to deploy from any ref but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::bounded.tools deploys only from refs/heads/main (got ${{ github.ref }})"
+          exit 1
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      # Tripwire: the same gate `standard` runs on every PR. A deploy must not
+      # be the first thing to discover the Worker no longer builds.
+      - name: Run tests + typecheck + worker build (tripwire)
+        run: |
+          bun install --frozen-lockfile
+          bun test
+          bun x tsc --noEmit
+          WRANGLER_SEND_METRICS=false bun x wrangler deploy --dry-run
+
+      # Human approval BEFORE the mint — no account-wide Workers:Edit token
+      # exists until a human signs off. The broker's `environment` field is a
+      # PIN, not a reviewer gate (required-reviewer rules are unavailable on
+      # this plan), so this step IS the human gate; a consumer without it is
+      # only pin-gated. Same in-house composite the sibling lanes use.
+      - name: Await approval
+        uses: bounded-systems/await-approval@3eda4124e16463741037ebe8e546419eaaa4824b # main
+        with:
+          approvers: bdelanghe
+          issue-title: "Approve bounded.tools deploy (mints an account-wide Workers:Edit token)"
+          issue-body: >
+            A bounded.tools deploy run wants to mint a short-lived Workers Scripts:Edit token
+            (via the broker's /deploy/bounded-tools tier) and `wrangler deploy` the GitHub App
+            receiver + fleet CI snapshot Worker. The grant is account-wide (infra issue #50 q2).
+
+      - name: Mint the deploy token (via OIDC broker /deploy/bounded-tools)
+        id: token
+        env:
+          CF_BROKER_URL: ${{ vars.CF_BROKER_URL }}
+          # ONE audience per broker TIER, shared by every target in it — target
+          # identity lives in the workflowRef + environment pins, not here. A
+          # per-target audience 401s at the mint and breaks infra's proofs lane
+          # (check-sync's uniqueAud / Lean audiences_nodup).
+          DEPLOY_AUDIENCE: cloudflare-workers-deploy-broker
+        run: |
+          set -euo pipefail
+          # ORG variable, deliberately — a repo-level CF_BROKER_URL SHADOWS the
+          # org one, and a stale shadow cost infra a month of falsely-green runs.
+          [ -n "${CF_BROKER_URL:-}" ] || { echo "::error::org variable CF_BROKER_URL does not resolve here (do not set a repo-level one — it shadows)"; exit 1; }
+
+          jwt="$(curl -sf "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${DEPLOY_AUDIENCE}" \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value // empty')"
+          [ -n "$jwt" ] || { echo "::error::could not obtain an OIDC token for ${DEPLOY_AUDIENCE}"; exit 1; }
+
+          body="$(curl -sf -X POST "${CF_BROKER_URL%/}/deploy/bounded-tools" -H "Authorization: Bearer $jwt")" || {
+            echo "::error::broker refused to mint the deploy token."
+            echo "::error::  401 = owner/audience/workflow-ref/environment pin rejected"
+            echo "::error::  404 = WORKERS_DEPLOY has no 'bounded-tools' entry LIVE yet — merge the"
+            echo "::error::        infra registry entry AND redeploy the broker (broker-deploy.yml)"
+            echo "::error::  500 = broker misconfigured (CF_PG_WORKERS_SCRIPTS_EDIT unset)"
+            exit 1
+          }
+          tok="$(jq -r '.token // empty' <<<"$body")"
+          [ -n "$tok" ] || { echo "::error::broker returned no token"; exit 1; }
+          echo "::add-mask::$tok"
+
+          # Assert we got the intended target's token before using it.
+          got_deploy="$(jq -r '.deploy // "?"' <<<"$body")"
+          got_script="$(jq -r '.script // "?"' <<<"$body")"
+          [ "$got_deploy" = "bounded-tools" ] && [ "$got_script" = "bounded-tools" ] || {
+            echo "::error::unexpected mint response: deploy=$got_deploy script=$got_script (want bounded-tools/bounded-tools)"
+            exit 1
+          }
+          echo "✓ minted Workers:Edit token for deploy=bounded-tools"
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        id: deploy
+        env:
+          # The broker-minted, short-lived token — NOT a stored secret.
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The repo's own pinned wrangler, not a floating npx version: the
+          # dry-run tripwire above and this deploy then run the SAME wrangler,
+          # so "it bundled in CI" and "it bundled at deploy" cannot disagree.
+          bun x wrangler deploy | tee /tmp/wrangler-deploy.log
+          # Strip ANSI first — wrangler colourises, and a colour code inside a
+          # hostname silently breaks the match.
+          sed 's/\x1b\[[0-9;]*m//g' /tmp/wrangler-deploy.log > /tmp/wd-plain.log
+          # Two different shapes in that output, hence two parses:
+          #   "  https://bounded-tools.<sub>.workers.dev"  ← full URL
+          #   "  bounded.tools (custom domain)"            ← bare hostname
+          url="$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' /tmp/wd-plain.log | head -n1 || true)"
+          custom="$(grep -E '\(custom domain\)' /tmp/wd-plain.log | head -n1 | awk '{print $1}' || true)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "custom_domain=$custom" >> "$GITHUB_OUTPUT"
+          [ -n "$url" ] && echo "workers.dev: $url" || echo "no workers.dev URL in this deploy (workers_dev is false)"
+          [ -n "$custom" ] && echo "custom domain: $custom" || echo "no custom domain in this deploy"
+
+      # The webhook secret, as an OIDC artifact — generated here, never seen by
+      # anyone, both halves written by machinery. Worker half FIRST: if the App
+      # half then fails, deliveries are signed with the old secret against a
+      # Worker holding the new one — rejected, fail closed — and the run FAILS
+      # naming the one fix (re-run). The reverse order has the same window; what
+      # matters is that a partial failure is loud and converges on re-run.
+      - name: Sync webhook secret (OIDC artifact — nobody holds it)
+        if: ${{ inputs.sync_webhook_secret }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          CF_BROKER_URL: ${{ vars.CF_BROKER_URL }}
+          APPHOOK_AUDIENCE: app-hook-broker
+        run: |
+          set -euo pipefail
+          secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$secret"
+
+          # Worker half — a script-settings write under the SAME minted token
+          # (infra's `rotate` precedent: a secret put IS a deploy).
+          printf '%s' "$secret" | bun x wrangler secret put GITHUB_WEBHOOK_SECRET
+
+          # App half — the broker PATCHes the App's hook config as the App.
+          jwt="$(curl -sf "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${APPHOOK_AUDIENCE}" \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value // empty')"
+          [ -n "$jwt" ] || { echo "::error::could not obtain an OIDC token for ${APPHOOK_AUDIENCE}"; exit 1; }
+
+          body="$(curl -sf -X POST "${CF_BROKER_URL%/}/apphook/bounded-tools" \
+            -H "Authorization: Bearer $jwt" -H "content-type: application/json" \
+            -d "{\"secret\":\"$secret\"}")" || {
+            echo "::error::broker refused the App-side secret write. THE HALVES NOW DISAGREE:"
+            echo "::error::the Worker holds a new secret, the App still signs with the old one,"
+            echo "::error::so every delivery is rejected (fail closed) until a re-run converges them."
+            echo "::error::  401 = audience/workflow-ref/owner pin rejected"
+            echo "::error::  404 = APP_HOOK_CONFIG has no live bounded-tools entry — merge the infra"
+            echo "::error::        registry AND redeploy the broker (broker-deploy.yml)"
+            echo "::error::  500 = appId unfilled or GH_APP_PRX_PRIVATE_KEY not set on the broker"
+            echo "::error::        (bootstrap steps in infra's APP_HOOK_CONFIG comment)"
+            echo "::error::  502 = GitHub refused the hook-config PATCH"
+            exit 1
+          }
+          hook_url="$(jq -r '.hook_url // "?"' <<<"$body")"
+          echo "✓ webhook secret rotated on both sides (App hook: $hook_url)"
+
+      - name: Note the skipped secret sync
+        if: ${{ !inputs.sync_webhook_secret }}
+        run: |
+          echo "::warning::sync_webhook_secret=false — the Worker may hold no (or a stale)"
+          echo "::warning::GITHUB_WEBHOOK_SECRET. The receiver fails closed: /ci.json serves,"
+          echo "::warning::but every delivery is rejected until a run with the sync enabled."
+
+      # Not "does something answer" — the static site answers today, with a
+      # 404, which is exactly how this Worker's absence went unnoticed. So probe
+      # a route only the WORKER can serve, and check the body, not the status.
+      #
+      # A deploy that parsed no hostname fails here rather than passing
+      # vacuously: a verification guaranteed to skip on the run where nothing
+      # is yet proven is the "green from a job that did nothing" defect this
+      # whole project exists to catch.
+      - name: Liveness probe (every hostname this deploy exposed)
+        env:
+          DEPLOYED_URL: ${{ steps.deploy.outputs.url }}
+          CUSTOM_DOMAIN: ${{ steps.deploy.outputs.custom_domain }}
+        run: |
+          set -euo pipefail
+          targets=()
+          [ -n "${CUSTOM_DOMAIN:-}" ] && targets+=("https://${CUSTOM_DOMAIN}")
+          [ -n "${DEPLOYED_URL:-}" ] && targets+=("${DEPLOYED_URL%/}")
+          [ ${#targets[@]} -gt 0 ] || { echo "::error::deploy exposed no parseable hostname — nothing was verified"; exit 1; }
+
+          for base in "${targets[@]}"; do
+            echo "── probing $base"
+
+            # /health: the Worker answers "ok" in plain text. The static site
+            # answers 404 with HTML, so this distinguishes "the Worker is
+            # serving" from "something is serving" — the exact confusion that
+            # let a never-deployed receiver look fine for months.
+            health="$(curl -sS --max-time 20 "$base/health")"
+            [ "$health" = "ok" ] || { echo "::error::$base/health returned '${health:0:120}' (want 'ok')"; exit 1; }
+            echo "  ✓ /health"
+
+            # /ci.json: valid JSON carrying the contract's two mandatory fields.
+            snap="$(curl -sS --max-time 20 "$base/ci.json")"
+            jq -e '.generated_at and (.coverage_complete | type == "boolean")' >/dev/null <<<"$snap" || {
+              echo "::error::$base/ci.json is not a valid snapshot: ${snap:0:200}"; exit 1; }
+
+            # Second-precision RFC 3339, enforced because jq's fromdateiso8601
+            # rejects fractional seconds — a worker emitting milliseconds would
+            # have every consumer read its snapshot as unanswered.
+            stamp="$(jq -r '.generated_at' <<<"$snap")"
+            [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || {
+              echo "::error::generated_at '$stamp' is not second-precision RFC 3339 UTC"; exit 1; }
+            jq -e --arg s "$stamp" '$s | fromdateiso8601 | . > 0' >/dev/null <<<"$snap" || {
+              echo "::error::generated_at '$stamp' does not parse with fromdateiso8601 (the consumers' parser)"; exit 1; }
+            echo "  ✓ /ci.json (generated_at $stamp)"
+          done
+
+          echo "::notice::Deployed and serving. The receiver still ingests nothing until"
+          echo "::notice::GITHUB_WEBHOOK_SECRET is set as a Worker Secret and the App's"
+          echo "::notice::hook URL points here — /ci.json will report coverage_complete: false."
