@@ -101,6 +101,65 @@ export default {
       });
     }
 
+    // App Manifest flow, entry side (infra docs/app-surface.md). GitHub's
+    // manifest flow requires a browser FORM POST (a plain link cannot carry the
+    // manifest), so this page renders the form: the create-app lane passes the
+    // git-declared manifest as base64url in ?m=, the human reviews it and
+    // clicks the one button App creation irreducibly requires. Nothing here is
+    // secret — the manifest is public config, declared in infra.
+    if (url.pathname === "/app-create") {
+      const org = url.searchParams.get("org") ?? "bounded-systems";
+      if (!/^[A-Za-z0-9-]{1,39}$/.test(org)) return new Response("malformed org", { status: 400 });
+      let manifest: string;
+      try {
+        const b64 = (url.searchParams.get("m") ?? "").replace(/-/g, "+").replace(/_/g, "/");
+        manifest = JSON.stringify(JSON.parse(atob(b64)), null, 2);
+      } catch {
+        return new Response("?m= must be base64url-encoded manifest JSON — generate this URL via the create-app lane", { status: 400 });
+      }
+      const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      const html = `<!doctype html><meta charset="utf-8"><title>Create GitHub App — review manifest</title>
+<body style="font-family:system-ui;max-width:44rem;margin:3rem auto;line-height:1.5">
+<h1>Create GitHub App on ${esc(org)}</h1>
+<p>Review the manifest (declared in <code>infra/github-admin/app-manifests/</code>), then create.
+GitHub will redirect back to <code>/app-created</code> with the one-time code for the lane's
+exchange phase — the private key is born machine-side; you never touch it.</p>
+<form action="https://github.com/organizations/${esc(org)}/settings/apps/new" method="post">
+<textarea name="manifest" readonly rows="18" style="width:100%;font-family:monospace">${esc(manifest)}</textarea>
+<p><button type="submit" style="font-size:1.1rem;padding:.5rem 1.5rem">Create GitHub App</button></p>
+</form></body>`;
+      return new Response(html, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
+    // App Manifest flow relay (infra docs/app-surface.md). GitHub redirects the
+    // browser here after the human clicks "Create GitHub App", carrying a
+    // one-time code. This page RELAYS the code to the human, who pastes it into
+    // the create-app lane's exchange phase — it deliberately does NOT exchange
+    // the code itself: the exchange response contains the App's private key,
+    // and this Worker holding PEMs (even in memory) would change the custody
+    // class for nothing the lane can't do. A manifest code is a claim ticket,
+    // not a key — one hour, one use, worthless once exchanged.
+    if (url.pathname === "/app-created") {
+      const code = url.searchParams.get("code") ?? "";
+      if (!/^[A-Za-z0-9_-]{1,255}$/.test(code)) {
+        return new Response("missing or malformed ?code= — this page is the App Manifest redirect target; reach it via the create-app lane, not directly", { status: 400 });
+      }
+      const html = `<!doctype html><meta charset="utf-8"><title>App created — relay the code</title>
+<body style="font-family:system-ui;max-width:40rem;margin:3rem auto;line-height:1.5">
+<h1>GitHub App created</h1>
+<p>Paste this one-time code into the <strong>create-app</strong> lane's exchange phase
+(<code>bounded-systems/infra</code> → Actions → <code>create-app.yml</code>, input <code>code</code>):</p>
+<pre style="padding:1rem;border:1px solid #8884;user-select:all">${code}</pre>
+<p>It expires in one hour and dies on first use. The lane exchanges it, validates the
+App, and writes the private key straight into the broker's Worker Secrets — no human
+ever holds the PEM.</p></body>`;
+      return new Response(html, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
     if (url.pathname === "/setup") {
       const installationId = url.searchParams.get("installation_id");
       const action = url.searchParams.get("setup_action");
