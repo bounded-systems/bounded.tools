@@ -114,23 +114,58 @@ export default {
     // clicks the one button App creation irreducibly requires. Nothing here is
     // secret — the manifest is public config, declared in infra.
     if (url.pathname === "/app-create") {
+      // ?owner= picks the creation endpoint. Defaults to "org" so every URL the
+      // create-app lane has ever printed keeps working unchanged.
+      //
+      // This is not cosmetic. A PRIVATE App installs only on its owner, so an
+      // App that must install on a personal account has to be OWNED by that
+      // account — the alternative is public:true, which is unacceptable for a
+      // privileged door because anyone who finds it can install it. And App
+      // ownership CANNOT be changed after creation: the wrong endpoint means
+      // deleting the App and starting over. Both endpoints render a page that
+      // works, so the mistake is silent until someone tries to install.
+      const owner = url.searchParams.get("owner") ?? "org";
+      if (owner !== "org" && owner !== "user") {
+        return new Response("?owner= must be 'org' or 'user'", { status: 400 });
+      }
       const org = url.searchParams.get("org") ?? "bounded-systems";
-      if (!/^[A-Za-z0-9-]{1,39}$/.test(org)) return new Response("malformed org", { status: 400 });
+      if (owner === "org" && !/^[A-Za-z0-9-]{1,39}$/.test(org)) {
+        return new Response("malformed org", { status: 400 });
+      }
+      const action =
+        owner === "user"
+          ? "https://github.com/settings/apps/new"
+          : `https://github.com/organizations/${org}/settings/apps/new`;
       let manifest: string;
       try {
         const b64 = (url.searchParams.get("m") ?? "").replace(/-/g, "+").replace(/_/g, "/");
-        manifest = JSON.stringify(JSON.parse(atob(b64)), null, 2);
+        const parsed = JSON.parse(atob(b64));
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+        // Strip local annotation keys. GitHub's manifest schema has a FIXED
+        // field set and rejects a payload carrying fields it does not know;
+        // `$comment` is the org's convention for recording why a manifest looks
+        // the way it does. create-app.yml strips it upstream, so this page has
+        // been safe only by virtue of its one caller sanitising first — a
+        // different caller handing over a raw manifest gets a Create button
+        // that silently fails. Strip here too, so the endpoint is correct on
+        // its own terms rather than by luck.
+        const payload = Object.fromEntries(
+          Object.entries(parsed as Record<string, unknown>).filter(([k]) => !k.startsWith("$")),
+        );
+        manifest = JSON.stringify(payload, null, 2);
       } catch {
         return new Response("?m= must be base64url-encoded manifest JSON — generate this URL via the create-app lane", { status: 400 });
       }
       const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
       const html = `<!doctype html><meta charset="utf-8"><title>Create GitHub App — review manifest</title>
 <body style="font-family:system-ui;max-width:44rem;margin:3rem auto;line-height:1.5">
-<h1>Create GitHub App on ${esc(org)}</h1>
+<h1>Create GitHub App on ${owner === "user" ? "your user account" : esc(org)}</h1>
 <p>Review the manifest (declared in <code>infra/github-admin/app-manifests/</code>), then create.
 GitHub will redirect back to <code>/app-created</code> with the one-time code for the lane's
 exchange phase — the private key is born machine-side; you never touch it.</p>
-<form action="https://github.com/organizations/${esc(org)}/settings/apps/new" method="post">
+<form action="${esc(action)}" method="post">
 <textarea name="manifest" readonly rows="18" style="width:100%;font-family:monospace">${esc(manifest)}</textarea>
 <p><button type="submit" style="font-size:1.1rem;padding:.5rem 1.5rem">Create GitHub App</button></p>
 </form></body>`;
