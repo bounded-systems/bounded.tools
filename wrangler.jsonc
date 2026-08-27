@@ -38,6 +38,22 @@
     {
       "pattern": "hooks.bounded.tools",
       "custom_domain": true
+    },
+    {
+      // github.bounded.tools — the read-only GitHub API door (#36, served at
+      // /gh/*). A second custom domain on the SAME Worker, same precedent as
+      // hooks above: domains attach with the scripts-only minted token and the
+      // binding moves through the approval-gated deploy lane. The door's mint
+      // (binding.internal/apptoken/bs-door-github-read) rides the existing
+      // BROKER service binding below; the read-scope grant is the broker
+      // registry entry in infra, and until that entry exists the door answers
+      // 502 at mint — fail-closed, the intended arrival state.
+      //
+      // Secret (set with `wrangler secret put`, NEVER here and never in git):
+      //   DOOR_LEASES — named bearer leases, `name:token` per line. Absent ⇒
+      //                 the door refuses every request (503).
+      "pattern": "github.bounded.tools",
+      "custom_domain": true
     }
   ],
   // A receiver holding a webhook secret should not also be reachable at

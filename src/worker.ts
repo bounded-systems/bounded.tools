@@ -14,12 +14,18 @@
 
 import { CiStateDO } from "./ci-do";
 import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
+import { handleGithubDoor } from "./github-door";
 import { listInstallationRepos } from "./reconcile";
 
 export { CiStateDO };
 
 export type Env = {
   GITHUB_WEBHOOK_SECRET?: string;
+  /** Named bearer leases for the read-only GitHub door (src/github-door.ts),
+   *  `name:token` per line. Worker secret. Absent ⇒ the door refuses all. */
+  DOOR_LEASES?: string;
+  /** Broker registry app the door mints as (default bs-door-github-read). */
+  DOOR_APP?: string;
   /** Manual OVERRIDE of the coverage denominator (comma-separated repos).
    *  Normally empty: the reconcile cron keeps the real list in the DO. Set it
    *  only to force a specific denominator while debugging; absent + no
@@ -87,6 +93,13 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") return new Response("ok");
+
+    // The read-only GitHub door (#36) — see src/github-door.ts for the three
+    // gates. Served by path, not hostname: github.bounded.tools is the naming
+    // convenience, but the policy must hold on every host this Worker answers.
+    if (url.pathname === "/gh" || url.pathname.startsWith("/gh/")) {
+      return handleGithubDoor(request, env);
+    }
 
     // The fleet CI snapshot — the sibling of the status layer's /status.json,
     // read via one owned host so a session needs one allowlist entry rather
