@@ -64,7 +64,14 @@
     // EMPTY: the reconcile cron below keeps the real list (the App's live
     // installation list) in the DO. Setting this forces a specific denominator
     // for debugging; a wrong list claims completeness it does not have.
-    "CI_REPOS_KNOWN": ""
+    "CI_REPOS_KNOWN": "",
+    // PR-feed reprojection (.github-private#719). BOTH EMPTY = the pull_request
+    // branch adapts and counts but dispatches nothing, which is the correct
+    // state until a broker tier exists that mints `contents: write` on the
+    // target and nothing else. bs-door-hooks cannot: it is metadata:read only.
+    // Set together - either alone leaves the branch disabled.
+    "PR_DISPATCH_REPO": "",
+    "PR_DISPATCH_APP": ""
   },
   // The reconcile cron (#481 increment 4): hourly, refresh the coverage
   // denominator via the broker's service-binding plane. Off-minute on purpose —

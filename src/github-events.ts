@@ -119,3 +119,72 @@ export function adaptWorkflowRun(payload: WorkflowRunPayload): AdaptResult {
     },
   };
 }
+
+// ── pull_request -> PR-projection reprojection (.github-private#719) ─────────
+//
+// The PR feed at prs.bounded.tools is an hourly cron snapshot, and the cron is
+// not reliable: measured 2026-08-28, its lane had fired zero scheduled runs
+// since creation, and the sibling board lane's "hourly" starts show gaps of two
+// to ten hours. .github-private#719 added a `repository_dispatch` trigger of
+// type `pr-activity` so something can say when reality changed. This adapter
+// decides which deliveries are worth saying it for.
+
+/** The subset of a `pull_request` delivery this adapter reads. */
+export type PullRequestPayload = {
+  action?: string;
+  number?: number;
+  pull_request?: { number?: number; draft?: boolean };
+  repository?: { full_name?: string };
+};
+
+export type PrAdaptResult =
+  | { ok: true; trigger: { repo: string; number: number; action: string } }
+  | { ok: false; reason: PrAdaptSkipReason };
+
+export type PrAdaptSkipReason =
+  | "action-not-projected" // real event, but nothing the feed renders changed
+  | "malformed"; // required fields absent - a delivery we cannot trust
+
+/** The actions that change what the PR feed RENDERS.
+ *
+ *  The feed lists open PRs with their repo, number, title and draft state, so
+ *  the set is derived from that projection rather than from what feels
+ *  important: open-ness (`opened`/`closed`/`reopened`), draft state
+ *  (`ready_for_review`/`converted_to_draft`), and title (`edited`).
+ *
+ *  `synchronize` is deliberately ABSENT and is the one worth naming: a push to
+ *  a PR branch is the single most frequent pull_request delivery in an active
+ *  org, and it changes nothing the feed shows. Including it would spend a
+ *  reprojection per push - the "noise machine nobody reads" shape the org's
+ *  dependabot template warns about, transposed onto CI minutes. Same for
+ *  `labeled`, `assigned` and `review_requested`: real events, invisible here. */
+const REPROJECTING_ACTIONS: ReadonlySet<string> = new Set([
+  "opened",
+  "closed",
+  "reopened",
+  "ready_for_review",
+  "converted_to_draft",
+  "edited",
+]);
+
+/** Adapt one `pull_request` delivery into a decision to reproject.
+ *
+ *  Returns a REASON on skip for the same purpose the workflow_run adapter does:
+ *  a receiver that silently drops deliveries is indistinguishable from one
+ *  watching a quiet org, and "we dispatched nothing" must stay visibly
+ *  different from "nothing happened". */
+export function adaptPullRequest(payload: PullRequestPayload): PrAdaptResult {
+  const action = payload.action;
+  if (!action || !REPROJECTING_ACTIONS.has(action)) {
+    return { ok: false, reason: "action-not-projected" };
+  }
+
+  const repo = payload.repository?.full_name;
+  // GitHub sends the number at the top level AND inside pull_request; either is
+  // authoritative, and a delivery carrying neither is not one to act on.
+  const number = payload.pull_request?.number ?? payload.number;
+
+  if (!repo || typeof number !== "number") return { ok: false, reason: "malformed" };
+
+  return { ok: true, trigger: { repo, number, action } };
+}

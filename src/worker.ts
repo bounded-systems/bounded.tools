@@ -13,7 +13,12 @@
 // until someone runs `wrangler deploy` and points a route at it.
 
 import { CiStateDO } from "./ci-do";
-import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
+import {
+  adaptWorkflowRun,
+  adaptPullRequest,
+  type WorkflowRunPayload,
+  type PullRequestPayload,
+} from "./github-events";
 import { handleGithubDoor } from "./github-door";
 import { listInstallationRepos } from "./reconcile";
 
@@ -35,6 +40,14 @@ export type Env = {
   /** Service binding to cf-token-broker — the reconcile cron's mint path
    *  (binding.internal/apptoken/bs-door-hooks, metadata:read only). */
   BROKER: Fetcher;
+  /** `owner/repo` to poke with a `pr-activity` repository_dispatch when a
+   *  pull_request delivery changes what the PR feed renders
+   *  (.github-private#719). EMPTY BY DEFAULT, and deliberately so — see the
+   *  handler for the capability this needs and does not yet have. */
+  PR_DISPATCH_REPO?: string;
+  /** Broker registry app to mint the dispatch token as. Must carry
+   *  `contents: write` on PR_DISPATCH_REPO and nothing else. */
+  PR_DISPATCH_APP?: string;
 };
 
 const enc = new TextEncoder();
@@ -88,8 +101,65 @@ async function verifySignature(
 
 const ci = (env: Env) => env.CI_STATE.get(env.CI_STATE.idFromName("fleet"));
 
+/** POST a `pr-activity` repository_dispatch at the PR-projection lane.
+ *
+ *  WHY A DISPATCH AND NOT A DIRECT WRITE. The feed is published by a workflow
+ *  (.github-private `pr-projection.yml`) that reads the org's open PRs and
+ *  force-pushes two snapshot branches. This receiver has no business
+ *  reproducing that; it only knows that something changed. A fire-and-forget
+ *  dispatch is also what the org's own front-desk-sync.yml header prescribes
+ *  for outside callers, and for a reason that applies here too: a dispatched
+ *  run is never attached to the caller's PR as a status check.
+ *
+ *  The payload is informational. `pr-projection.yml` branches on nothing in it
+ *  — every event produces the same whole-board reprojection — so this exists
+ *  to make a run's Actions page say WHY it ran rather than to be read by it. */
+async function dispatchPrActivity(
+  env: Env,
+  target: string,
+  app: string,
+  cause: { repo: string; number: number; action: string },
+): Promise<void> {
+  const mint = await env.BROKER.fetch(`https://binding.internal/apptoken/${app}`, {
+    method: "POST",
+  });
+  if (!mint.ok) {
+    console.error(`[pull_request] broker mint failed for ${app}: ${mint.status}`);
+    return;
+  }
+  const { token } = (await mint.json()) as { token?: string };
+  if (!token) {
+    console.error(`[pull_request] broker returned no token for ${app}`);
+    return;
+  }
+
+  const res = await fetch(`https://api.github.com/repos/${target}/dispatches`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+      "user-agent": "bounded-tools-receiver",
+    },
+    body: JSON.stringify({ event_type: "pr-activity", client_payload: cause }),
+  });
+
+  // 204 is the documented success. Anything else is logged with its status:
+  // a 403 here means the minted token lacks `contents: write` on the target,
+  // which is the one failure worth telling apart from a transient one.
+  if (res.status !== 204) {
+    console.error(
+      `[pull_request] dispatch ${target} returned ${res.status} (403 => token lacks contents:write)`,
+    );
+    return;
+  }
+  console.log(
+    `[pull_request] ${cause.repo}#${cause.number} ${cause.action} -> dispatched pr-activity at ${target}`,
+  );
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") return new Response("ok");
@@ -246,6 +316,41 @@ ever holds the PEM.</p></body>`;
         });
         console.log(
           `[workflow_run] ${result.observation.repo} ${result.observation.workflow} -> ${result.observation.conclusion}`,
+        );
+        return new Response("ok");
+      }
+
+      if (event === "pull_request") {
+        const result = adaptPullRequest(payload as PullRequestPayload);
+        if (!result.ok) {
+          console.log(`[pull_request] skipped reason=${result.reason}`);
+          return new Response("ok");
+        }
+        const { repo, number, action } = result.trigger;
+
+        // DISABLED UNTIL PROVISIONED, and empty is the honest default rather
+        // than a bug. Firing repository_dispatch needs `contents: write` on the
+        // target repo, and the only token this Worker can mint today is
+        // bs-door-hooks — `metadata: read` ONLY. Enabling this is therefore not
+        // a code change: it needs a broker registry tier (infra) that mints
+        // `contents: write` scoped to PR_DISPATCH_REPO alone, and that is a
+        // deliberate authority decision on the org's only private repo, not
+        // something to widen quietly. Until both vars are set the branch does
+        // exactly what it does now: adapt, count, and return.
+        const target = env.PR_DISPATCH_REPO?.trim();
+        const app = env.PR_DISPATCH_APP?.trim();
+        if (!target || !app) {
+          console.log(`[pull_request] ${repo}#${number} ${action} -> dispatch-disabled`);
+          return new Response("ok");
+        }
+
+        // Best-effort, and never a delivery failure: GitHub retries a non-2xx
+        // webhook, and a retry storm against a broken mint would achieve
+        // nothing a later cron does not. The log is the record.
+        ctx.waitUntil(
+          dispatchPrActivity(env, target, app, { repo, number, action }).catch((e) =>
+            console.error(`[pull_request] dispatch failed: ${e instanceof Error ? e.message : e}`),
+          ),
         );
         return new Response("ok");
       }

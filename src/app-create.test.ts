@@ -20,7 +20,13 @@ const b64url = (o: unknown) =>
   btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 const get = (qs: string) =>
-  worker.fetch(new Request(`https://hooks.bounded.tools/app-create?${qs}`), {} as never);
+  worker.fetch(
+    new Request(`https://hooks.bounded.tools/app-create?${qs}`),
+    {} as never,
+    // ctx: this route defers nothing, but fetch's signature now carries the
+    // ExecutionContext the pull_request branch waits on (.github-private#719).
+    { waitUntil: () => {}, passThroughOnException: () => {} } as never,
+  );
 
 /** The form's action, exactly — a substring check cannot tell an endpoint from
  *  one embedded in another host's query string. */

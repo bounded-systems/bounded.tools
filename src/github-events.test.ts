@@ -1,5 +1,10 @@
 import { describe, test, expect } from "bun:test";
-import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
+import {
+  adaptWorkflowRun,
+  adaptPullRequest,
+  type WorkflowRunPayload,
+  type PullRequestPayload,
+} from "./github-events";
 
 // Each field is merged into its own default rather than replacing it, so a case
 // can vary one key without restating the whole delivery.
@@ -114,5 +119,98 @@ describe("adaptWorkflowRun", () => {
       adaptWorkflowRun({ action: "completed" }),
     ].map((r) => (r.ok ? null : r.reason));
     expect(reasons).toEqual(["not-completed", "not-default-branch", "malformed"]);
+  });
+});
+
+// ── adaptPullRequest (.github-private#719) ───────────────────────────────────
+
+const pr = (over: Partial<PullRequestPayload> = {}): PullRequestPayload => ({
+  action: "action" in over ? over.action : "opened",
+  number: "number" in over ? over.number : 719,
+  // `"pull_request" in over` rather than a truthiness check: a case must be
+  // able to say "this delivery has NO pull_request object" by passing
+  // undefined explicitly, which a `=== undefined` test would silently
+  // overwrite with the default.
+  pull_request: "pull_request" in over ? over.pull_request : { number: 719, draft: false },
+  repository: { full_name: "bounded-systems/.github-private", ...over.repository },
+});
+
+describe("adaptPullRequest", () => {
+  test("opened is a reprojection", () => {
+    const r = adaptPullRequest(pr());
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.trigger).toEqual({
+      repo: "bounded-systems/.github-private",
+      number: 719,
+      action: "opened",
+    });
+  });
+
+  test("every action that changes what the feed renders", () => {
+    for (const action of [
+      "opened",
+      "closed",
+      "reopened",
+      "ready_for_review",
+      "converted_to_draft",
+      "edited",
+    ]) {
+      expect(adaptPullRequest(pr({ action })).ok).toBe(true);
+    }
+  });
+
+  // The load-bearing skip. A push to a PR branch is the most frequent
+  // pull_request delivery in an active org and changes nothing the feed shows;
+  // dispatching on it would spend a reprojection per push.
+  test("synchronize is skipped — a push changes nothing the feed renders", () => {
+    const r = adaptPullRequest(pr({ action: "synchronize" }));
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.reason).toBe("action-not-projected");
+  });
+
+  test("other real-but-invisible actions are skipped with a reason", () => {
+    for (const action of ["labeled", "unlabeled", "assigned", "review_requested"]) {
+      const r = adaptPullRequest(pr({ action }));
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.reason).toBe("action-not-projected");
+    }
+  });
+
+  test("a missing action is a skip, not a crash", () => {
+    const r = adaptPullRequest(pr({ action: undefined }));
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.reason).toBe("action-not-projected");
+  });
+
+  test("the number may arrive at the top level only", () => {
+    const r = adaptPullRequest(pr({ pull_request: undefined, number: 42 }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.trigger.number).toBe(42);
+  });
+
+  test("pull_request.number wins when both are present", () => {
+    const r = adaptPullRequest(pr({ number: 1, pull_request: { number: 719 } }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.trigger.number).toBe(719);
+  });
+
+  test("no number anywhere is malformed", () => {
+    const r = adaptPullRequest(pr({ pull_request: undefined, number: undefined }));
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.reason).toBe("malformed");
+  });
+
+  test("no repository is malformed", () => {
+    const r = adaptPullRequest({ action: "opened", number: 1 });
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.reason).toBe("malformed");
   });
 });
