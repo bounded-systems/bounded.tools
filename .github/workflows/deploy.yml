@@ -4,8 +4,13 @@ name: deploy
 # Same lane shape as infra's status-deploy.yml / broker-deploy.yml and
 # front-desk-scheduler's lease-deploy.yml: OIDC → the broker's
 # /deploy/bounded-tools tier mints a short-lived Workers Scripts:Edit token, a
-# human approves BEFORE the mint, `wrangler deploy` uses it, then a probe
-# confirms the deployed hostnames actually serve.
+# human authorizes BEFORE the mint with a Face ID ceremony, `wrangler deploy` uses
+# it, then a probe confirms the deployed hostnames actually serve.
+#
+# THE GATE IS A FACE ID CEREMONY, not a comment (infra#480, carried here by
+# infra#538). There is no break-glass (infra#18): while keeper.bounded.tools is
+# down this lane does not run. The ceremony step records why that is the right
+# trade for this lane specifically.
 #
 # Cross-repo by design (the `lease` precedent): the Worker's source lives here
 # with its tests, and the broker pins workflowRef exactly, so which FILE may
@@ -59,7 +64,7 @@ on:
 
 permissions:
   id-token: write # OIDC -> broker /deploy/bounded-tools
-  issues: write # manual-approval opens/updates the approval issue
+  issues: write # the ceremony opens a notification issue carrying the approve URL
 
 # One deploy at a time; never cancel a deploy already in flight.
 concurrency:
@@ -90,20 +95,107 @@ jobs:
           bun x tsc --noEmit
           WRANGLER_SEND_METRICS=false bun x wrangler deploy --dry-run
 
-      # Human approval BEFORE the mint — no account-wide Workers:Edit token
-      # exists until a human signs off. The broker's `environment` field is a
-      # PIN, not a reviewer gate (required-reviewer rules are unavailable on
-      # this plan), so this step IS the human gate; a consumer without it is
-      # only pin-gated. Same in-house composite the sibling lanes use.
-      - name: Await approval
-        uses: bounded-systems/await-approval@3eda4124e16463741037ebe8e546419eaaa4824b # main
-        with:
-          approvers: bdelanghe
-          issue-title: "Approve bounded.tools deploy (mints an account-wide Workers:Edit token)"
-          issue-body: >
-            A bounded.tools deploy run wants to mint a short-lived Workers Scripts:Edit token
-            (via the broker's /deploy/bounded-tools tier) and `wrangler deploy` the GitHub App
-            receiver + fleet CI snapshot Worker. The grant is account-wide (infra issue #50 q2).
+      # Human authorization BEFORE the mint — no credential exists until a Face ID has
+      # signed THIS run's request (infra#480; the same shape as desk's deploy.yml and
+      # keeper-deploy in bounded-systems/infra). The keeper URL is a literal on purpose:
+      # a variable here would let configuration move the ceremony somewhere else.
+      #
+      # THIS REPLACED A COMMENT GATE (infra#538). infra#235 established that
+      # `await-approval` cannot tell the dispatcher from the approver — whoever dispatches
+      # a run can approve their own — so what it gated was a formality. infra#480 retired
+      # it; this lane kept it only because the migration was rolled out to a LIST of lanes
+      # rather than to everything matching the predicate, and nothing measured the
+      # remainder. infra#538's `gate-strength` check now does, for infra; this repo is
+      # outside that check's reach, which is why the migration had to be carried here by
+      # hand.
+      #
+      # There is NO break-glass, following infra#18: a single-boolean bypass to a
+      # mechanism known not to work is not a fallback. The test is whether the lane is
+      # upstream of the keeper's own fix path — keeper-deploy keeps one because a broken
+      # keeper cannot serve the ceremony that repairs it. This lane authorizes nothing the
+      # keeper depends on, so while keeper.bounded.tools is down it simply does not run.
+      - name: Open the Face ID ceremony
+        id: ceremony
+        env:
+          KEEPER_URL: https://keeper.bounded.tools
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          req="$(jq -nc --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" \
+            '{v:"bounded.deploy-request.v1",repo:"bounded.tools",workflow:"deploy.yml",run_id:$run,head_sha:$sha}')"
+          start="$(curl -sfS --max-time 20 -X POST -H 'content-type: application/json' \
+            -d "{\"requestType\":\"bounded.deploy-request.v1\",\"request\":$req}" \
+            "$KEEPER_URL/authorize/start")" || {
+            echo "::error::the keeper refused to open a ceremony. There is no break-glass (infra#18): this lane does not run until keeper.bounded.tools is back."
+            exit 1
+          }
+          ceremony="$(jq -r '.ceremonyId // empty' <<<"$start")"
+          approve_url="$(jq -r '.approveUrl // empty' <<<"$start")"
+          [ -n "$ceremony" ] && [ -n "$approve_url" ] || { echo "::error::keeper returned no ceremony"; exit 1; }
+          echo "ceremony=$ceremony" >> "$GITHUB_OUTPUT"
+          echo "request=$req" >> "$GITHUB_OUTPUT"
+          # The issue is a NOTIFICATION, not a credential: commenting on it does nothing.
+          # The approval is the Face ID at the URL.
+          issue_url="$(gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Face ID: approve bounded.tools deploy (run ${GITHUB_RUN_ID})" \
+            --body "$(printf 'A bounded.tools deploy run wants to mint a short-lived account-wide Workers Scripts:Edit token (broker /deploy/bounded-tools) and `wrangler deploy` the GitHub App receiver + fleet CI snapshot Worker. With sync_webhook_secret it also rotates the webhook secret on both sides.\n\nApprove with your passkey (15-minute window):\n\n%s\n\nThis issue is a notification only — comments here authorize nothing (infra#480 retired the comment gate). Run: https://github.com/%s/actions/runs/%s' "$approve_url" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")")"
+          echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
+          echo "ceremony open — approve at $approve_url"
+
+      - name: Wait for the Face ID, then redeem — fail closed
+        env:
+          KEEPER_URL: https://keeper.bounded.tools
+          CEREMONY: ${{ steps.ceremony.outputs.ceremony }}
+          REQ: ${{ steps.ceremony.outputs.request }}
+        run: |
+          set -euo pipefail
+          # Poll until the human approves, the ceremony expires (15 min), or the keeper
+          # says GONE. pending/gone being distinct answers is what makes this loop's
+          # failure mean "never approved", not "lost a race".
+          deadline="$(( $(date +%s) + 900 ))"
+          auth=""
+          while :; do
+            code="$(curl -s --max-time 20 -o /tmp/result.json -w '%{http_code}' "$KEEPER_URL/result?id=${CEREMONY}")" || code=000
+            if [ "$code" = "200" ]; then
+              if jq -e '.pending' /tmp/result.json >/dev/null 2>&1; then :; else
+                auth="$(jq -r '.authorizationId // empty' /tmp/result.json)"
+                [ -n "$auth" ] && break
+              fi
+            elif [ "$code" = "410" ]; then
+              echo "::error::the ceremony ended without an authorization: $(jq -r '.error // "gone"' /tmp/result.json 2>/dev/null). Nobody Face ID'd this run."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no Face ID within the 15-minute window — this run was not authorized."
+              exit 1
+            fi
+            sleep 10
+          done
+          redeem="$(curl -sS --max-time 20 -X POST -H 'content-type: application/json' \
+            -d "{\"authorizationId\":\"$auth\",\"requestType\":\"bounded.deploy-request.v1\",\"request\":$REQ}" \
+            "$KEEPER_URL/redeem")"
+          person="$(jq -r '.redeemed.person // empty' <<<"$redeem")"
+          if [ -z "$person" ]; then
+            echo "::error::redemption refused: $(jq -r '.error // "unknown"' <<<"$redeem"). The grant did not match this run's request — failing closed."
+            exit 1
+          fi
+          cred="$(jq -r '.redeemed.credentialId' <<<"$redeem")"
+          be="$(jq -r '.redeemed.backupEligible' <<<"$redeem")"
+          {
+            echo "## Authorized by Face ID"
+            echo "- person: \`$person\`"
+            echo "- credential: \`$cred\`"
+            echo "- backupEligible: \`$be\` (synced passkey ⇒ aal2 — recorded, not assumed away)"
+            echo "- request bound to run ${GITHUB_RUN_ID} @ ${GITHUB_SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "✓ authorized by $person (credential $cred)"
+
+      - name: Close the ceremony notification
+        if: ${{ steps.ceremony.outputs.issue_url != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_URL: ${{ steps.ceremony.outputs.issue_url }}
+        run: gh issue close "$ISSUE_URL" --comment "Authorized by Face ID; ceremony complete." || true
 
       - name: Mint the deploy token (via OIDC broker /deploy/bounded-tools)
         id: token
