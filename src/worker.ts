@@ -16,6 +16,7 @@ import { CiStateDO } from "./ci-do";
 import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
 import { handleGithubDoor } from "./github-door";
 import { listInstallationRepos } from "./reconcile";
+import { decide, dispatch } from "./dispatch-events";
 
 export { CiStateDO };
 
@@ -33,8 +34,15 @@ export type Env = {
   CI_REPOS_KNOWN?: string;
   CI_STATE: DurableObjectNamespace;
   /** Service binding to cf-token-broker — the reconcile cron's mint path
-   *  (binding.internal/apptoken/bs-door-hooks, metadata:read only). */
+   *  (binding.internal/apptoken/bs-door-hooks, metadata:read only) and the
+   *  dispatch door's (bs-door-dispatch, contents:write on SELECTED repos). */
   BROKER: Fetcher;
+  /** Broker registry entry the dispatch sender mints as. Default
+   *  bs-door-dispatch. Absent from the registry ⇒ the mint 404s and the
+   *  dispatch is skipped with a logged reason — the consumers' crons are the
+   *  backstop, so a missing door degrades freshness rather than breaking
+   *  ingestion. */
+  DISPATCH_APP?: string;
 };
 
 const enc = new TextEncoder();
@@ -89,7 +97,12 @@ async function verifySignature(
 const ci = (env: Env) => env.CI_STATE.get(env.CI_STATE.idFromName("fleet"));
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  // `ctx` is optional in the signature ONLY so existing callers that pass two
+  // arguments keep type-checking (app-create.test.ts is one). The runtime
+  // always supplies it; the fallback below awaits inline rather than assuming
+  // it is there, so a two-arg caller gets correct behaviour instead of a
+  // TypeError inside a webhook handler.
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") return new Response("ok");
@@ -250,7 +263,63 @@ ever holds the PEM.</p></body>`;
         return new Response("ok");
       }
 
-      console.log(`[webhook] event=${event} action=${payload.action ?? ""}`);
+      // ── The dispatch sender (.github-private#779) ──────────────────────
+      //
+      // The projections declare `repository_dispatch` receivers and had never
+      // received one, because no sender was ever built — so they ran on cron
+      // alone, and an hourly cron on GitHub Actions is not a delivery
+      // guarantee (36 of ~106 slots over 106 hours; the one DAILY lane in the
+      // same repo took ~98%). The board read 6h46m stale on 2026-08-29 (#801)
+      // and a session cannot read it any other way (#431).
+      //
+      // ALWAYS 200, WHATEVER HAPPENS BELOW. GitHub disables a webhook whose
+      // deliveries keep failing, so throwing here to report a dispatch problem
+      // would cost the events that still work — including `workflow_run`,
+      // which is this Worker's original job. Failures are logged and the
+      // consumers' crons remain the backstop.
+      const decision = decide(event, payload.action);
+      if (!decision.ok) {
+        // Logged with the reason, never silent. An absent sender stayed
+        // invisible for weeks precisely because nothing said the path was
+        // cold; a sender that drops deliveries quietly would be the same
+        // defect wearing a fix.
+        console.log(`[webhook] event=${event} action=${payload.action ?? ""} skip=${decision.reason}`);
+        return new Response("ok");
+      }
+
+      const work = (async () => {
+        const app = env.DISPATCH_APP ?? "bs-door-dispatch";
+        const mint = await env.BROKER.fetch(`https://binding.internal/apptoken/${app}`, { method: "POST" });
+        if (!mint.ok) {
+          // 403 here is the broker's own scope guard (infra#529) refusing a
+          // privileged door whose installation has been widened past the repos
+          // it is registered for. That is a correct refusal, not a transport
+          // fault, and it names itself in the broker's logs — so say which
+          // status came back rather than collapsing to "mint failed".
+          console.error(`[dispatch] broker mint ${app} failed: ${mint.status}`);
+          return;
+        }
+        const { token } = (await mint.json()) as { token?: string };
+        if (!token) {
+          console.error(`[dispatch] broker returned no token for ${app}`);
+          return;
+        }
+        // Per target, not all-or-nothing: one repo refusing must not cost the
+        // other its wake-up. Both are needed — waking only the private lane
+        // leaves the PUBLIC feed stale, which is where the wrong number was
+        // actually read.
+        const outcomes = await Promise.all(decision.targets.map((t) => dispatch(t, token)));
+        for (const o of outcomes) {
+          const line = `${o.target.repo} <- ${o.target.eventType} (${o.status})`;
+          if (o.ok) console.log(`[dispatch] ${line}`);
+          else console.error(`[dispatch] FAILED ${line}`);
+        }
+      })().catch((e) => {
+        console.error(`[dispatch] failed: ${e instanceof Error ? e.message : e}`);
+      });
+      if (ctx?.waitUntil) ctx.waitUntil(work);
+      else await work;
+
       return new Response("ok");
     }
 
