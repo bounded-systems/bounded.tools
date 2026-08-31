@@ -542,6 +542,11 @@ jobs:
           GRANT_NAME: ${{ inputs.grant_relay_lease }}
           RELAY_BASE: https://hooks.bounded.tools
           SLOT_LAST: ${{ vars.RELAY_LEASE_SLOT_LAST }}
+          # gh needs both (#65) — this lane, unlike rotate-lease-key.yml, sets
+          # neither at the job level, and the first grant run died at
+          # `gh variable set` with the token already written and verified.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # The lease-table grammar is names-colon-tokens; a name that cannot
@@ -580,10 +585,16 @@ jobs:
             sleep 10
           done
           [ "$ok" = "400" ] || { echo "::error::the granted token answered ${ok:-nothing} (want 400) — refusing to hand off a token that does not authenticate"; exit 1; }
-
-          gh variable set RELAY_LEASE_SLOT_LAST --body "$slot"
           echo "✓ grant '$GRANT_NAME' written to slot $slot and verified live"
 
+          # EMIT BEFORE THE BOOKKEEPING (#65). The failure modes are not
+          # symmetric: a delivered token with stale bookkeeping costs one early
+          # displacement on the next grant; stale bookkeeping with an
+          # undelivered token costs the whole grant and leaves live key
+          # material nobody holds — which is exactly how the first grant run
+          # ended when `gh` failed after the write.
           echo "==== granted relay lease token ($GRANT_NAME) ================================"
           echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
           printf '%s' "$token" | age -r "$RECIPIENT" -a
+
+          gh variable set RELAY_LEASE_SLOT_LAST --body "$slot"
