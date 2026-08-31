@@ -108,6 +108,17 @@ export function decide(event: string | null, action: string | undefined): Decide
       // it was about — so an unwoken feed makes the notification actively
       // wrong: it says the board changed and hands the reader a board that has
       // not. Worse than not notifying.
+      //
+      // BOTH TARGETS NARROW THAT; NEITHER CLOSES IT. The push comes from the
+      // FIRST target's lane (front-desk-projection.yml is NOTIFY_WORKFLOW_REFS[0]
+      // in desk's src/oidc.js) and the board it points at is the SECOND target's
+      // `feed` branch — and this dispatches to both at once, so the fast lane can
+      // still notify before the slow one has published. front-desk-feed's
+      // publish.yml mints a broker token, queries the whole board, signs twice
+      // and force-pushes; it is not going to win that race. Fanning out here
+      // takes the skew from up to an hour down to the length of that job, which
+      // is all a sender can do — ordering two repos' Actions lanes is not
+      // something this Worker can express.
       return fanout("board-changed", [".github-private", "front-desk-feed"]);
 
     default:
