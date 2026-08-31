@@ -75,10 +75,16 @@ on:
         description: >-
           Grant a per-session relay bearer (#62): a lease NAME
           ([A-Za-z0-9._-]+, e.g. session-rqpjei). Writes `<name>:<token>` into
-          the STALE grant slot (CLAUDE_RELAY_LEASES_A/_B, round-robin via the
-          RELAY_LEASE_SLOT_LAST repo variable), displacing only the oldest
-          grant — the standing line is untouched. Token emitted ONLY
-          age-encrypted to lease_recipient.
+          the name's HOME slot (CLAUDE_RELAY_LEASES_A/_B, hash of the name —
+          #68: no stored bookkeeping, and re-granting the same name refreshes
+          its own slot instead of evicting the neighbour). The standing line is
+          untouched. Token emitted ONLY age-encrypted to lease_recipient.
+        required: false
+        default: ""
+      grant_slot:
+        description: >-
+          Override the grant's home slot (A or B) — the escape hatch for two
+          names hashing to the same slot. Leave empty for the hash default.
         required: false
         default: ""
       lease_recipient:
@@ -94,7 +100,10 @@ on:
 permissions:
   id-token: write # OIDC -> broker /deploy/bounded-tools
   issues: write # the ceremony opens a notification issue carrying the approve URL
-  actions: write # `gh variable set` — grant-slot bookkeeping (#62), names and dates only
+  # actions:write is deliberately GONE (#68): it was added for `gh variable set`
+  # slot bookkeeping, which GITHUB_TOKEN cannot do here anyway (403 "Resource
+  # not accessible by integration", measured on run 33414469223) — slot choice
+  # is now derived from the grant name and needs no write at all.
 
 # One deploy at a time; never cancel a deploy already in flight.
 concurrency:
@@ -530,23 +539,19 @@ jobs:
 
       # A per-session grant (#62): same custody as the rotate step above, into
       # a SLOT instead of the standing line. Worker Secrets are write-only, so
-      # multi-holder is a bounded ring — the stale slot is overwritten
-      # (displacing only the OLDEST grant), and which slot is stale is
-      # bookkeeping over names and dates in a repo variable, the
-      # rotate-lease-key.yml convention.
+      # multi-holder is a bounded ring. Which slot is the name's own HASH
+      # (#68): GITHUB_TOKEN cannot write repo variables (403, measured), and
+      # the home-slot rule is better anyway — re-granting a name refreshes its
+      # own bearer instead of evicting the neighbour, and two names colliding
+      # on one slot have the grant_slot override.
       - name: Grant a per-session relay lease (age-encrypted hand-off)
         if: ${{ inputs.grant_relay_lease != '' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
           RECIPIENT: ${{ inputs.lease_recipient }}
           GRANT_NAME: ${{ inputs.grant_relay_lease }}
+          GRANT_SLOT: ${{ inputs.grant_slot }}
           RELAY_BASE: https://hooks.bounded.tools
-          SLOT_LAST: ${{ vars.RELAY_LEASE_SLOT_LAST }}
-          # gh needs both (#65) — this lane, unlike rotate-lease-key.yml, sets
-          # neither at the job level, and the first grant run died at
-          # `gh variable set` with the token already written and verified.
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # The lease-table grammar is names-colon-tokens; a name that cannot
@@ -561,11 +566,16 @@ jobs:
             exit 1
           }
 
-          # Round-robin: overwrite the slot NOT written last. An unset variable
-          # means no grant has ever landed — start at A.
-          case "${SLOT_LAST:-B}" in
-            A) slot=B ;;
-            *) slot=A ;;
+          # The name's home slot, or the explicit override. cksum, not a
+          # cryptographic hash: this is a bucket choice, not a security
+          # property, and cksum is POSIX-everywhere.
+          case "${GRANT_SLOT:-}" in
+            A|B) slot="$GRANT_SLOT" ;;
+            "")
+              n="$(printf '%s' "$GRANT_NAME" | cksum | cut -d' ' -f1)"
+              if [ $((n % 2)) -eq 0 ]; then slot=A; else slot=B; fi
+              ;;
+            *) echo "::error::grant_slot must be A, B, or empty (got '$GRANT_SLOT') — nothing was written"; exit 1 ;;
           esac
 
           token="$(openssl rand -hex 32)"
@@ -593,8 +603,6 @@ jobs:
           # undelivered token costs the whole grant and leaves live key
           # material nobody holds — which is exactly how the first grant run
           # ended when `gh` failed after the write.
-          echo "==== granted relay lease token ($GRANT_NAME) ================================"
+          echo "==== granted relay lease token ($GRANT_NAME, slot $slot) ===================="
           echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
           printf '%s' "$token" | age -r "$RECIPIENT" -a
-
-          gh variable set RELAY_LEASE_SLOT_LAST --body "$slot"
