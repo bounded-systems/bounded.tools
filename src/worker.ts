@@ -31,8 +31,11 @@ export type Env = {
   /** Named bearer leases for the Claude chat-session relay
    *  (src/claude-relay.ts), `name:token` per line. Worker secret — a separate
    *  secret from DOOR_LEASES on purpose, so each door revokes independently.
-   *  Absent ⇒ the relay refuses all. */
+   *  The standing line; _A/_B are the deploy lane's per-session grant slots
+   *  (#62), merged in the relay. All absent ⇒ the relay refuses all. */
   CLAUDE_RELAY_LEASES?: string;
+  CLAUDE_RELAY_LEASES_A?: string;
+  CLAUDE_RELAY_LEASES_B?: string;
   /** Manual OVERRIDE of the coverage denominator (comma-separated repos).
    *  Normally empty: the reconcile cron keeps the real list in the DO. Set it
    *  only to force a specific denominator while debugging; absent + no

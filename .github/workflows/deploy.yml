@@ -71,18 +71,30 @@ on:
           table (single-holder v1).
         type: boolean
         default: false
+      grant_relay_lease:
+        description: >-
+          Grant a per-session relay bearer (#62): a lease NAME
+          ([A-Za-z0-9._-]+, e.g. session-rqpjei). Writes `<name>:<token>` into
+          the STALE grant slot (CLAUDE_RELAY_LEASES_A/_B, round-robin via the
+          RELAY_LEASE_SLOT_LAST repo variable), displacing only the oldest
+          grant — the standing line is untouched. Token emitted ONLY
+          age-encrypted to lease_recipient.
+        required: false
+        default: ""
       lease_recipient:
         description: >-
-          EPHEMERAL age recipient (age1… or ssh-ed25519/ssh-rsa) for the rotated
-          lease token — generate a throwaway keypair right before dispatching,
-          decrypt this run's output with it, then delete it. Required when
-          rotate_relay_lease is true; validated BEFORE anything is written.
+          EPHEMERAL age recipient (age1… or ssh-ed25519/ssh-rsa) for the
+          rotated or granted lease token — generate a throwaway keypair right
+          before dispatching, decrypt this run's output with it, then delete
+          it. Required with rotate_relay_lease or grant_relay_lease; validated
+          BEFORE anything is written.
         required: false
         default: ""
 
 permissions:
   id-token: write # OIDC -> broker /deploy/bounded-tools
   issues: write # the ceremony opens a notification issue carrying the approve URL
+  actions: write # `gh variable set` — grant-slot bookkeeping (#62), names and dates only
 
 # One deploy at a time; never cancel a deploy already in flight.
 concurrency:
@@ -513,5 +525,65 @@ jobs:
           echo "✓ lease armed: the 503→401 flip observed, and the new token authenticates (lease name: sessions)"
 
           echo "==== relay lease token — the Authorization bearer for /claude/sessions ======"
+          echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
+          printf '%s' "$token" | age -r "$RECIPIENT" -a
+
+      # A per-session grant (#62): same custody as the rotate step above, into
+      # a SLOT instead of the standing line. Worker Secrets are write-only, so
+      # multi-holder is a bounded ring — the stale slot is overwritten
+      # (displacing only the OLDEST grant), and which slot is stale is
+      # bookkeeping over names and dates in a repo variable, the
+      # rotate-lease-key.yml convention.
+      - name: Grant a per-session relay lease (age-encrypted hand-off)
+        if: ${{ inputs.grant_relay_lease != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          RECIPIENT: ${{ inputs.lease_recipient }}
+          GRANT_NAME: ${{ inputs.grant_relay_lease }}
+          RELAY_BASE: https://hooks.bounded.tools
+          SLOT_LAST: ${{ vars.RELAY_LEASE_SLOT_LAST }}
+        run: |
+          set -euo pipefail
+          # The lease-table grammar is names-colon-tokens; a name that cannot
+          # appear in it must fail before anything is written, like the
+          # recipient below.
+          printf '%s' "$GRANT_NAME" | grep -Eq '^[A-Za-z0-9._-]+$' || {
+            echo "::error::grant_relay_lease must match [A-Za-z0-9._-]+ — nothing was written"; exit 1; }
+          [ -n "${RECIPIENT:-}" ] || { echo "::error::grant_relay_lease needs lease_recipient (an ephemeral age recipient) — nothing was written"; exit 1; }
+          command -v age >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
+          printf 'probe' | age -r "$RECIPIENT" -a >/dev/null 2>&1 || {
+            echo "::error::age rejected the recipient — NOTHING was written, the slots are untouched."
+            exit 1
+          }
+
+          # Round-robin: overwrite the slot NOT written last. An unset variable
+          # means no grant has ever landed — start at A.
+          case "${SLOT_LAST:-B}" in
+            A) slot=B ;;
+            *) slot=A ;;
+          esac
+
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          printf '%s:%s' "$GRANT_NAME" "$token" | bun x wrangler secret put "CLAUDE_RELAY_LEASES_$slot"
+
+          # The new token must authenticate before it is handed off: 400 on a
+          # malformed body = past the lease gate, nothing fetched. Bounded
+          # retries absorb secret-version rollout. (No 503/401 discriminator
+          # here — the standing line keeps the relay armed throughout.)
+          ok=""
+          for attempt in $(seq 1 12); do
+            ok="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
+              -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' || true)"
+            [ "$ok" = "400" ] && break
+            echo "  … attempt $attempt: new token answered '${ok:-none}' (want 400) — retrying in 10s"
+            sleep 10
+          done
+          [ "$ok" = "400" ] || { echo "::error::the granted token answered ${ok:-nothing} (want 400) — refusing to hand off a token that does not authenticate"; exit 1; }
+
+          gh variable set RELAY_LEASE_SLOT_LAST --body "$slot"
+          echo "✓ grant '$GRANT_NAME' written to slot $slot and verified live"
+
+          echo "==== granted relay lease token ($GRANT_NAME) ================================"
           echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
           printf '%s' "$token" | age -r "$RECIPIENT" -a

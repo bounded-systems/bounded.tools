@@ -39,9 +39,25 @@ import { authenticate, parseLeases } from "./github-door";
 
 export type RelayEnv = {
   /** Named bearer leases, one `name:token` per line (or comma-separated).
-   *  Worker secret — never in git. Absent or empty ⇒ the relay refuses all. */
+   *  Worker secret — never in git. The STANDING line: long-lived holders
+   *  (a phone Shortcut), rotated deliberately. */
   CLAUDE_RELAY_LEASES?: string;
+  /** Grant slots (#62): per-session bearers written round-robin by the deploy
+   *  lane's grant input. Slots exist because Worker Secrets are write-only —
+   *  "append a line" is impossible, so multi-holder means a bounded ring, and
+   *  a new grant displaces only the OLDEST grant, never the standing line.
+   *  All three merge into one lease table; all absent ⇒ refuse all. */
+  CLAUDE_RELAY_LEASES_A?: string;
+  CLAUDE_RELAY_LEASES_B?: string;
 };
+
+/** The merged lease table. Newline-joined so a slot value can never splice
+ *  into another's trailing line, whatever it ends with. */
+export function mergedLeases(env: RelayEnv): string {
+  return [env.CLAUDE_RELAY_LEASES, env.CLAUDE_RELAY_LEASES_A, env.CLAUDE_RELAY_LEASES_B]
+    .filter((v): v is string => typeof v === "string" && v.length > 0)
+    .join("\n");
+}
 
 export const SHARE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -275,7 +291,7 @@ export async function handleClaudeRelay(
 ): Promise<Response> {
   const fetchImpl = deps.fetchImpl ?? fetch;
 
-  const leases = parseLeases(env.CLAUDE_RELAY_LEASES);
+  const leases = parseLeases(mergedLeases(env));
   if (leases.size === 0) {
     // Unconfigured ⇒ closed for everyone — and distinguishable from a bad
     // lease, so "the relay is down" and "your lease is wrong" never blur.

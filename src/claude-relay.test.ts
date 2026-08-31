@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   handleClaudeRelay,
+  mergedLeases,
   parseClaim,
   parseShareUrl,
   snapshotToGraph,
@@ -148,6 +149,33 @@ describe("snapshotToGraph", () => {
     expect(snapshotToGraph({ chat_messages: [] }, UUID)).toMatchObject({ ok: false });
     expect(snapshotToGraph(null, UUID)).toMatchObject({ ok: false });
     expect(snapshotToGraph([], UUID)).toMatchObject({ ok: false });
+  });
+});
+
+describe("mergedLeases", () => {
+  test("standing line and grant slots merge into one table; a slot's holder authenticates", async () => {
+    const env: RelayEnv = {
+      CLAUDE_RELAY_LEASES: `phone:${LEASE}p`,
+      CLAUDE_RELAY_LEASES_A: `session-a:${LEASE}a`,
+      CLAUDE_RELAY_LEASES_B: `session-b:${LEASE}b`,
+    };
+    const table = mergedLeases(env);
+    expect([...(await import("./github-door")).parseLeases(table).keys()]).toEqual([
+      "phone",
+      "session-a",
+      "session-b",
+    ]);
+  });
+
+  test("newline-joined, so a slot without a trailing newline never splices the next line", () => {
+    const table = mergedLeases({ CLAUDE_RELAY_LEASES: "a:x", CLAUDE_RELAY_LEASES_B: "b:y" });
+    expect(table).toBe("a:x\nb:y");
+  });
+
+  test("all absent is an empty table — the 503 fail-closed state is preserved", async () => {
+    expect(mergedLeases({})).toBe("");
+    const res = await handleClaudeRelay(post({ share_url: UUID }, LEASE), {});
+    expect(res.status).toBe(503);
   });
 });
 
