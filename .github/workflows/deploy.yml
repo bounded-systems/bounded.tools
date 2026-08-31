@@ -134,6 +134,7 @@ jobs:
           [ -n "$ceremony" ] && [ -n "$approve_url" ] || { echo "::error::keeper returned no ceremony"; exit 1; }
           echo "ceremony=$ceremony" >> "$GITHUB_OUTPUT"
           echo "request=$req" >> "$GITHUB_OUTPUT"
+          echo "approve_url=$approve_url" >> "$GITHUB_OUTPUT"
           # The issue is a NOTIFICATION, not a credential: commenting on it does nothing.
           # The approval is the Face ID at the URL.
           issue_url="$(gh issue create --repo "$GITHUB_REPOSITORY" \
@@ -141,6 +142,55 @@ jobs:
             --body "$(printf 'A bounded.tools deploy run wants to mint a short-lived account-wide Workers Scripts:Edit token (broker /deploy/bounded-tools) and `wrangler deploy` the GitHub App receiver + fleet CI snapshot Worker. With sync_webhook_secret it also rotates the webhook secret on both sides.\n\nApprove with your passkey (15-minute window):\n\n%s\n\nThis issue is a notification only — comments here authorize nothing (infra#480 retired the comment gate). Run: https://github.com/%s/actions/runs/%s' "$approve_url" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")")"
           echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
           echo "ceremony open — approve at $approve_url"
+
+      # BEFORE the wait below. The issue above is a GitHub notification — batched,
+      # routed wherever GitHub decides, and no use against a window that can be as
+      # short as two minutes. infra#552 gave the seven infra ceremony lanes a push;
+      # this lane was not in that scope, and on 2026-08-31 a ceremony here opened,
+      # waited its full window and reached no phone (infra#553).
+      #
+      # No guard, because the ceremony above has none: this lane has no break-glass
+      # (infra#18), so if the ceremony ran, an approval is genuinely waiting.
+      #
+      # Non-fatal on every path. The gate is the Face ID; a notice that failed to
+      # send must not fail a deploy that is otherwise authorized.
+      - name: Notify subscribed devices that an approval is waiting
+        env:
+          APPROVE_URL: ${{ steps.ceremony.outputs.approve_url }}
+          NOTICE_TITLE: Approve bounded.tools deploy
+          NOTICE_BODY: >-
+            Mints an account-wide Workers Scripts:Edit token and deploys the GitHub App
+            receiver — the Worker that fans org activity out to the desk and PR feeds.
+        run: |
+          set -euo pipefail
+          summary() { echo "$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          if [ -z "${APPROVE_URL:-}" ]; then
+            summary "Approval notice: skipped — no approve URL from the ceremony."
+            exit 0
+          fi
+          tok="$(curl -sS --max-time 20 \
+                   -H "authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
+                   "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=https://desk.bounded.tools" \
+                 | jq -r '.value // empty' || true)"
+          if [ -z "$tok" ]; then
+            echo "::warning::could not mint an OIDC token for desk; no approval notice sent"
+            summary "Approval notice: **skipped** — no OIDC token."
+            exit 0
+          fi
+          payload="$(jq -nc --arg t "$NOTICE_TITLE" --arg b "$NOTICE_BODY" \
+                       --arg u "$APPROVE_URL" --arg r "$GITHUB_RUN_ID" \
+            '{title:$t, body:($b + " Run " + $r + "."), url:$u}')"
+          code="$(curl -sS --max-time 30 -o /tmp/appr.json -w '%{http_code}' -X POST \
+                    -H "authorization: Bearer $tok" -H 'content-type: application/json' \
+                    -d "$payload" https://desk.bounded.tools/approval || true)"
+          case "$code" in
+            200) summary "$(jq -r '"Approval notice: sent \(.sent)/\(.total) — pruned \(.pruned), failed \(.failed)"' /tmp/appr.json)" ;;
+            403) summary "Approval notice: desk has not allowlisted this lane yet (HTTP 403 — add this workflow's ref to NOTIFY_WORKFLOW_REFS in desk's src/oidc.js and deploy desk)." ;;
+            404|405|503) summary "Approval notice: not available on the deployed Worker yet (HTTP $code)." ;;
+            *)   echo "::warning::desk /approval answered ${code:-no response}"
+                 summary "Approval notice: **failed** — desk answered ${code:-no response}." ;;
+          esac
+          exit 0
 
       - name: Wait for the Face ID, then redeem — fail closed
         env:
