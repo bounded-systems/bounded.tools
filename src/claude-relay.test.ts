@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   handleClaudeRelay,
+  parseClaim,
   parseShareUrl,
   snapshotToGraph,
   type RelayEnv,
@@ -150,6 +151,29 @@ describe("snapshotToGraph", () => {
   });
 });
 
+describe("parseClaim", () => {
+  test("absent is null; well-formed passes with issue as string or number", () => {
+    expect(parseClaim(undefined)).toBeNull();
+    expect(parseClaim({ repo: "bounded.tools", issue: 59 })).toEqual({ repo: "bounded.tools", issue: "59" });
+    expect(parseClaim({ repo: "infra", issue: "123" })).toEqual({ repo: "infra", issue: "123" });
+  });
+
+  test("the door's grammar is enforced here — bad shapes are malformed, not dropped", () => {
+    for (const bad of [
+      { repo: "owner/repo", issue: 1 }, // no owner prefix — plain repo names only
+      { repo: "infra", issue: 0 },
+      { repo: "infra", issue: -3 },
+      { repo: "infra", issue: "12345678901" }, // 11 digits
+      { repo: "", issue: 1 },
+      { repo: "infra" },
+      "infra#1",
+      [],
+    ]) {
+      expect(parseClaim(bad)).toBe("malformed");
+    }
+  });
+});
+
 // ── the handler, upstream faked ──────────────────────────────────────────────
 
 function env(leases?: string): RelayEnv {
@@ -227,6 +251,63 @@ describe("handleClaudeRelay", () => {
       expect(res.status).toBe(502);
       expect(await res.text()).toContain(String(status));
     }
+  });
+
+  test("with a claim, the graph goes through the door and the door's answer passes through verbatim", async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, body: init?.body as string | undefined });
+      if (url.includes("claude.ai")) return new Response(JSON.stringify(snapshot), { status: 200 });
+      return new Response(JSON.stringify({ url: "https://pathbase.dev/u/x/pathstash-infra/graphs/abc" }), {
+        status: 201,
+        headers: { "content-type": "application/json", "x-door-claim": "infra#123", "x-door-postback": "posted" },
+      });
+    }) as typeof fetch;
+    const res = await handleClaudeRelay(
+      post({ share_url: UUID, claim: { repo: "infra", issue: 123 } }, LEASE),
+      env(`ok:${LEASE}`),
+      { fetchImpl },
+    );
+    expect(res.status).toBe(201);
+    expect(res.headers.get("x-door-claim")).toBe("infra#123");
+    expect(res.headers.get("x-door-postback")).toBe("posted");
+    expect(((await res.json()) as { url: string }).url).toContain("pathstash-infra");
+    expect(calls.map((c) => c.url)).toEqual([
+      `https://claude.ai/api/chat_snapshots/${UUID}?rendering_mode=messages`,
+      "https://pathbase.bounded.tools/c/infra/123/api/v1/u/anon/repos/pathstash/graphs",
+    ]);
+    // the door's declared shape: exactly one top-level key, "document"
+    const doorBody = JSON.parse(calls[1]!.body!) as Record<string, unknown>;
+    expect(Object.keys(doorBody)).toEqual(["document"]);
+    expect((doorBody.document as { graph: { id: string } }).graph.id).toBe("path-claude-chat-2d5c237b");
+  });
+
+  test("a door refusal passes through with its own status, never blurred to 502", async () => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("claude.ai")) return new Response(JSON.stringify(snapshot), { status: 200 });
+      return new Response("no live claim on infra#999", { status: 403, headers: { "x-door-claim": "infra#999" } });
+    }) as typeof fetch;
+    const res = await handleClaudeRelay(
+      post({ share_url: UUID, claim: { repo: "infra", issue: "999" } }, LEASE),
+      env(`ok:${LEASE}`),
+      { fetchImpl },
+    );
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("no live claim");
+  });
+
+  test("a malformed claim is the caller's 400, and neither upstream is touched", async () => {
+    const { calls, fetchImpl } = upstreamReturning(200, JSON.stringify(snapshot));
+    const res = await handleClaudeRelay(
+      post({ share_url: UUID, claim: { repo: "owner/repo", issue: 1 } }, LEASE),
+      env(`ok:${LEASE}`),
+      { fetchImpl },
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("claim");
+    expect(calls).toEqual([]);
   });
 
   test("upstream non-JSON ⇒ 502; unconvertible snapshot ⇒ 422 with the reason", async () => {
