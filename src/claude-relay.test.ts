@@ -177,6 +177,17 @@ describe("mergedLeases", () => {
     const res = await handleClaudeRelay(post({ share_url: UUID }, LEASE), {});
     expect(res.status).toBe(503);
   });
+
+  test("a grant slot reusing the standing name never displaces the standing token (#71)", async () => {
+    const env: RelayEnv = {
+      CLAUDE_RELAY_LEASES: `sessions:${LEASE}standing`,
+      CLAUDE_RELAY_LEASES_A: `sessions:${LEASE}imposter`,
+    };
+    const { parseLeases, authenticate } = await import("./github-door");
+    const leases = parseLeases(mergedLeases(env));
+    expect(await authenticate(`Bearer ${LEASE}standing`, leases)).toBe("sessions");
+    expect(await authenticate(`Bearer ${LEASE}imposter`, leases)).toBeNull();
+  });
 });
 
 describe("parseClaim", () => {
@@ -189,6 +200,8 @@ describe("parseClaim", () => {
   test("the door's grammar is enforced here — bad shapes are malformed, not dropped", () => {
     for (const bad of [
       { repo: "owner/repo", issue: 1 }, // no owner prefix — plain repo names only
+      { repo: ".", issue: 1 }, // dot-segments: URL normalization would walk off /c/ (#71)
+      { repo: "..", issue: 1 },
       { repo: "infra", issue: 0 },
       { repo: "infra", issue: -3 },
       { repo: "infra", issue: "12345678901" }, // 11 digits
@@ -336,6 +349,14 @@ describe("handleClaudeRelay", () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain("claim");
     expect(calls).toEqual([]);
+  });
+
+  test("an oversized snapshot refuses with 413 naming the limit (#71)", async () => {
+    const fetchImpl = (async (_input: RequestInfo | URL) =>
+      new Response("{}", { status: 200, headers: { "content-length": String(64 * 1024 * 1024) } })) as unknown as typeof fetch;
+    const res = await handleClaudeRelay(post({ share_url: UUID }, LEASE), env(`ok:${LEASE}`), { fetchImpl });
+    expect(res.status).toBe(413);
+    expect(await res.text()).toContain("16777216");
   });
 
   test("upstream non-JSON ⇒ 502; unconvertible snapshot ⇒ 422 with the reason", async () => {

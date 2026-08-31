@@ -52,11 +52,28 @@ export type RelayEnv = {
 };
 
 /** The merged lease table. Newline-joined so a slot value can never splice
- *  into another's trailing line, whatever it ends with. */
+ *  into another's trailing line, whatever it ends with.
+ *
+ *  Duplicate NAMES resolve first-wins (#71 finding 3): parseLeases builds a
+ *  Map where a later entry would overwrite an earlier one, so without the
+ *  guard a grant slot reusing the standing line's name would silently
+ *  displace the standing holder — the exact thing the grant input promises
+ *  cannot happen. Standing line first + first-wins = the standing line always
+ *  survives a name collision. */
 export function mergedLeases(env: RelayEnv): string {
-  return [env.CLAUDE_RELAY_LEASES, env.CLAUDE_RELAY_LEASES_A, env.CLAUDE_RELAY_LEASES_B]
-    .filter((v): v is string => typeof v === "string" && v.length > 0)
-    .join("\n");
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const value of [env.CLAUDE_RELAY_LEASES, env.CLAUDE_RELAY_LEASES_A, env.CLAUDE_RELAY_LEASES_B]) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    for (const entry of value.split(/[\n,]/)) {
+      const sep = entry.indexOf(":");
+      const name = sep > 0 ? entry.slice(0, sep).trim() : "";
+      if (name && seen.has(name)) continue;
+      if (name) seen.add(name);
+      lines.push(entry);
+    }
+  }
+  return lines.join("\n");
 }
 
 export const SHARE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -262,6 +279,11 @@ export function parseClaim(input: unknown): DoorClaim | null | "malformed" {
     : typeof c.issue === "string"
       ? c.issue.trim()
       : "";
+  // "." and ".." pass the charset but are DOT-SEGMENTS: fetch's URL parser
+  // normalizes them away, moving the door POST off the /c/ tier (#71 finding
+  // 2). The door can never receive them (clients normalize before sending),
+  // so matching its grammar is not enough on the SENDING side.
+  if (repo === "." || repo === "..") return "malformed";
   if (!CLAIM_REPO.test(repo) || !CLAIM_ISSUE.test(issue)) return "malformed";
   return { repo, issue };
 }
@@ -278,6 +300,10 @@ export type RelayDeps = {
 // pinned here for the same reason it always was: a caller names a UUID, never
 // a URL to fetch.
 const SNAPSHOT_HOST = "https://claude.ai";
+
+/** Ceiling on the fetched snapshot (#71): half the pathbase door's 32MiB
+ *  document cap, because conversion roughly doubles the payload. */
+export const SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024;
 
 // The pathbase door's public custom domain (infra cloudflare/pathbase-door) —
 // a literal for the same reason SNAPSHOT_HOST is: a caller names a claim,
@@ -357,9 +383,26 @@ export async function handleClaudeRelay(
     });
   }
 
+  // Size ceiling (#71 finding 4): conversion roughly doubles the payload
+  // (every message rides in `raw` plus joined text) and the whole document is
+  // stringified, so an unbounded snapshot can blow the isolate's memory and
+  // answer with a nameless 1102 instead of a refusal that names the limit.
+  // 16MiB in keeps the produced Graph safely under the door's 32MiB cap.
+  const contentLength = Number(upstream.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > SNAPSHOT_MAX_BYTES) {
+    return new Response(`snapshot too large: ${contentLength} bytes (limit ${SNAPSHOT_MAX_BYTES})`, {
+      status: 413,
+    });
+  }
   let snapshot: unknown;
   try {
-    snapshot = await upstream.json();
+    const text = await upstream.text();
+    if (text.length > SNAPSHOT_MAX_BYTES) {
+      return new Response(`snapshot too large: over ${SNAPSHOT_MAX_BYTES} characters`, {
+        status: 413,
+      });
+    }
+    snapshot = JSON.parse(text);
   } catch {
     return new Response("snapshot fetch returned non-JSON", { status: 502 });
   }

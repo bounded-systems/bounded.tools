@@ -513,25 +513,30 @@ jobs:
           printf 'sessions:%s' "$token" | bun x wrangler secret put CLAUDE_RELAY_LEASES
 
           # Verify with the relay's own status discriminators, on the live
-          # host: 503 = no parseable lease (the write failed, or has not
-          # propagated), 401 = configured and refusing a garbage bearer — the
-          # flip that proves the secret dereferences. Then the NEW token
-          # against a malformed body must answer 400: authenticated past the
-          # lease gate, nothing fetched, nothing spent.
-          code=""
+          # host. THE RETRIES BELONG ON THE NEW-TOKEN CHECK (#71 finding 1):
+          # the garbage-bearer 401 is vacuously satisfied by any pre-existing
+          # lease, so it senses nothing about THIS write — it stays as a
+          # one-shot sanity probe (it still catches the from-nothing case,
+          # where a lingering 503 means the write failed outright). What
+          # senses secret-version rollout is the NEW token flipping 401→400
+          # (authenticated past the lease gate on a malformed body — nothing
+          # fetched, nothing spent), so that check carries the 12 retries,
+          # exactly as the grant step below always did (and needed: run
+          # 33414469223 measured attempt 1 answering 401).
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
+            -H 'authorization: Bearer garbage-bearer-000000000000' \
+            -H 'content-type: application/json' -d '{}' || true)"
+          [ "$code" = "401" ] || echo "  garbage-bearer probe answered '${code:-none}' — informational; the new-token check below is authoritative"
+          ok=""
           for attempt in $(seq 1 12); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
-              -H 'authorization: Bearer garbage-bearer-000000000000' \
-              -H 'content-type: application/json' -d '{}' || true)"
-            [ "$code" = "401" ] && break
-            echo "  … attempt $attempt: garbage bearer answered '${code:-none}' (want 401) — retrying in 10s"
+            ok="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
+              -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' || true)"
+            [ "$ok" = "400" ] && break
+            echo "  … attempt $attempt: new token answered '${ok:-none}' (want 400) — retrying in 10s"
             sleep 10
           done
-          [ "$code" = "401" ] || { echo "::error::relay still answers ${code:-nothing} to a garbage bearer — the lease did not arm"; exit 1; }
-          ok="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
-            -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' || true)"
           [ "$ok" = "400" ] || { echo "::error::the NEW token answered ${ok:-nothing} to a malformed body (want 400) — refusing to hand off a token that does not authenticate"; exit 1; }
-          echo "✓ lease armed: the 503→401 flip observed, and the new token authenticates (lease name: sessions)"
+          echo "✓ lease armed: the new token authenticates (lease name: sessions)"
 
           echo "==== relay lease token — the Authorization bearer for /claude/sessions ======"
           echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
@@ -559,6 +564,13 @@ jobs:
           # recipient below.
           printf '%s' "$GRANT_NAME" | grep -Eq '^[A-Za-z0-9._-]+$' || {
             echo "::error::grant_relay_lease must match [A-Za-z0-9._-]+ — nothing was written"; exit 1; }
+          # "sessions" is the standing line's name (the rotate step writes it,
+          # hardcoded above). The worker resolves duplicate names standing-
+          # first, so a grant reusing it could never authenticate — refuse it
+          # here with the reason, instead of handing off a dead token (#71
+          # finding 3's lane half).
+          [ "$GRANT_NAME" != "sessions" ] || {
+            echo "::error::grant_relay_lease must not reuse the standing lease name 'sessions' — nothing was written"; exit 1; }
           [ -n "${RECIPIENT:-}" ] || { echo "::error::grant_relay_lease needs lease_recipient (an ephemeral age recipient) — nothing was written"; exit 1; }
           command -v age >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
           printf 'probe' | age -r "$RECIPIENT" -a >/dev/null 2>&1 || {
