@@ -228,7 +228,12 @@ export type RelayDeps = {
   fetchImpl?: typeof fetch;
 };
 
-const SNAPSHOT_HOST = "https://api.claude.ai";
+// claude.ai serves its API same-origin — `api.claude.ai` is NXDOMAIN, measured
+// 2026-08-31 (#56): the Worker's fetch of it answered Cloudflare's 530
+// origin-DNS error, and a second client confirmed ENOTFOUND. The host stays
+// pinned here for the same reason it always was: a caller names a UUID, never
+// a URL to fetch.
+const SNAPSHOT_HOST = "https://claude.ai";
 
 export async function handleClaudeRelay(
   request: Request,
@@ -279,8 +284,12 @@ export async function handleClaudeRelay(
   );
   // The vendor answers 404 for both "never existed" and "not shared"; anything
   // else non-200 is the vendor's problem, relayed as 502 with the status named
-  // so the caller can tell a dead endpoint from a withdrawn share.
-  if (upstream.status === 404 || upstream.status === 403) {
+  // so the caller can tell a dead endpoint from a withdrawn share. 403 is
+  // DELIBERATELY not folded into 404 (#56): on this host a 403 can be the
+  // vendor's bot filtering refusing the Worker, and reading that as "not
+  // shared" would send the caller to re-share a chat that was never the
+  // problem. Named status beats a guessed meaning.
+  if (upstream.status === 404) {
     return new Response("snapshot not found — the chat is not (or no longer) shared", {
       status: 404,
     });

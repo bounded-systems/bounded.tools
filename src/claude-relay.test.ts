@@ -208,22 +208,25 @@ describe("handleClaudeRelay", () => {
     const res = await handleClaudeRelay(post({ share_url: `https://claude.ai/share/${UUID}` }, LEASE), env(`ok:${LEASE}`), { fetchImpl });
     expect(res.status).toBe(200);
     expect(calls).toEqual([
-      `https://api.claude.ai/api/chat_snapshots/${UUID}?rendering_mode=messages`,
+      `https://claude.ai/api/chat_snapshots/${UUID}?rendering_mode=messages`,
     ]);
     const doc = (await res.json()) as { graph: { id: string } };
     expect(doc.graph.id).toBe("path-claude-chat-2d5c237b");
   });
 
-  test("upstream 404/403 ⇒ 404; other upstream failures ⇒ 502 naming the status", async () => {
-    for (const status of [404, 403]) {
+  test("upstream 404 ⇒ 404; 403 and other failures ⇒ 502 naming the status", async () => {
+    const notFound = upstreamReturning(404, "");
+    const res404 = await handleClaudeRelay(post({ share_url: UUID }, LEASE), env(`ok:${LEASE}`), { fetchImpl: notFound.fetchImpl });
+    expect(res404.status).toBe(404);
+    // 403 is NOT "not shared" on this host — it can be the vendor's bot
+    // filtering refusing the Worker (#56), so it relays as 502 with the
+    // status named rather than sending the caller to re-share a chat.
+    for (const status of [403, 500, 530]) {
       const { fetchImpl } = upstreamReturning(status, "");
       const res = await handleClaudeRelay(post({ share_url: UUID }, LEASE), env(`ok:${LEASE}`), { fetchImpl });
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(502);
+      expect(await res.text()).toContain(String(status));
     }
-    const { fetchImpl } = upstreamReturning(500, "");
-    const res = await handleClaudeRelay(post({ share_url: UUID }, LEASE), env(`ok:${LEASE}`), { fetchImpl });
-    expect(res.status).toBe(502);
-    expect(await res.text()).toContain("500");
   });
 
   test("upstream non-JSON ⇒ 502; unconvertible snapshot ⇒ 422 with the reason", async () => {
