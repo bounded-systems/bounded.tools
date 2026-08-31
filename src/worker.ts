@@ -14,6 +14,7 @@
 
 import { CiStateDO } from "./ci-do";
 import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
+import { handleClaudeRelay } from "./claude-relay";
 import { handleGithubDoor } from "./github-door";
 import { listInstallationRepos } from "./reconcile";
 import { decide, dispatch } from "./dispatch-events";
@@ -27,6 +28,11 @@ export type Env = {
   DOOR_LEASES?: string;
   /** Broker registry app the door mints as (default bs-door-github-read). */
   DOOR_APP?: string;
+  /** Named bearer leases for the Claude chat-session relay
+   *  (src/claude-relay.ts), `name:token` per line. Worker secret — a separate
+   *  secret from DOOR_LEASES on purpose, so each door revokes independently.
+   *  Absent ⇒ the relay refuses all. */
+  CLAUDE_RELAY_LEASES?: string;
   /** Manual OVERRIDE of the coverage denominator (comma-separated repos).
    *  Normally empty: the reconcile cron keeps the real list in the DO. Set it
    *  only to force a specific denominator while debugging; absent + no
@@ -112,6 +118,13 @@ export default {
     // convenience, but the policy must hold on every host this Worker answers.
     if (url.pathname === "/gh" || url.pathname.startsWith("/gh/")) {
       return handleGithubDoor(request, env);
+    }
+
+    // The Claude chat-session relay (#50) — share link in, toolpath Graph out.
+    // Served by path like /gh above: the policy holds on every host this
+    // Worker answers.
+    if (url.pathname === "/claude/sessions") {
+      return handleClaudeRelay(request, env);
     }
 
     // The fleet CI snapshot — the sibling of the status layer's /status.json,
