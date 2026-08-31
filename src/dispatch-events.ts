@@ -21,8 +21,9 @@
 /** The dispatch types the existing receivers already accept. These are not new
  *  names — `pr-activity` and `claim-activity` are declared today in
  *  `.github-private`'s `pr-projection.yml` and `front-desk-feed`'s
- *  `publish.yml`, and have simply never been sent. `board-changed` is the one
- *  addition, for ProjectV2 edits, which no receiver could observe before. */
+ *  `publish.yml`, and have simply never been sent. `board-changed` was the one
+ *  addition, for ProjectV2 edits, which no receiver could observe before; both
+ *  receivers declare it now. */
 export type DispatchType = "pr-activity" | "claim-activity" | "board-changed";
 
 export type DispatchTarget = { owner: string; repo: string; eventType: DispatchType };
@@ -67,7 +68,9 @@ const PROJECT_ITEM_ACTIONS = new Set(["created", "edited", "deleted", "reordered
  *  `.github-private` holds the private projections a session reads;
  *  `front-desk-feed` publishes the public feed at prs.bounded.tools, whose
  *  "The backlog is drained" was false for a whole window while 88 PRs were
- *  open. Waking one and not the other fixes half the symptom. */
+ *  open — and the `feed` branch it force-pushes is also what desk.bounded.tools
+ *  renders as the board. Waking one and not the other fixes half the symptom,
+ *  and the half left broken is the one a reader is actually looking at. */
 export function decide(event: string | null, action: string | undefined): DecideResult {
   const fanout = (eventType: DispatchType, repos: string[]): DecideResult => ({
     ok: true,
@@ -88,9 +91,35 @@ export function decide(event: string | null, action: string | undefined): Decide
     case "projects_v2_item":
       if (!action) return { ok: false, reason: "no-action" };
       if (!PROJECT_ITEM_ACTIONS.has(action)) return { ok: false, reason: "action-not-watched" };
-      // The board projection is private-side only; the public feed derives from
-      // it rather than from ProjectV2 directly.
-      return fanout("board-changed", [".github-private"]);
+      // BOTH — and this said private-side only, on a premise that was simply
+      // wrong: "the public feed derives from [the board projection] rather than
+      // from ProjectV2 directly". It does not. `front-desk-feed`'s publish.yml
+      // runs its own `scripts/project.sh` against org project #2, and its `on:`
+      // block says so in as many words: dispatching `.github-private`'s
+      // front-desk-projection.yml "does NOT refresh this feed … different repo,
+      // different branch". So a board change woke the private lane and reached
+      // the public one through no path at all — the same hole the absent sender
+      // had, one event further in.
+      //
+      // Measured 2026-08-30: the board projection updated at 22:52 and
+      // desk.bounded.tools went on serving the 21:25 snapshot. That was merely
+      // stale until desk gained Web Push. Now a board change also sends a
+      // payload-less push whose service worker fetches the board to learn what
+      // it was about — so an unwoken feed makes the notification actively
+      // wrong: it says the board changed and hands the reader a board that has
+      // not. Worse than not notifying.
+      //
+      // BOTH TARGETS NARROW THAT; NEITHER CLOSES IT. The push comes from the
+      // FIRST target's lane (front-desk-projection.yml is NOTIFY_WORKFLOW_REFS[0]
+      // in desk's src/oidc.js) and the board it points at is the SECOND target's
+      // `feed` branch — and this dispatches to both at once, so the fast lane can
+      // still notify before the slow one has published. front-desk-feed's
+      // publish.yml mints a broker token, queries the whole board, signs twice
+      // and force-pushes; it is not going to win that race. Fanning out here
+      // takes the skew from up to an hour down to the length of that job, which
+      // is all a sender can do — ordering two repos' Actions lanes is not
+      // something this Worker can express.
+      return fanout("board-changed", [".github-private", "front-desk-feed"]);
 
     default:
       return { ok: false, reason: "event-not-watched" };

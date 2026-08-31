@@ -92,16 +92,29 @@ describe("issues — a claim IS the label or the assignee", () => {
 });
 
 describe("projects_v2_item — the signal that reaches no other event", () => {
-  test("card edits wake the private board projection only", () => {
-    // The public feed derives from the board projection rather than from
-    // ProjectV2 directly, so waking it here would be a second path to the same
-    // answer — and a second path is a second thing to keep in agreement.
-    expect(targets(decide("projects_v2_item", "edited"))).toEqual([".github-private:board-changed"]);
+  test("card edits wake BOTH board consumers", () => {
+    // This pinned `.github-private` alone, on the belief that the public feed
+    // derives from the board projection and so a second wake-up would be a
+    // second path to the same answer. There is no first path: front-desk-feed's
+    // publish.yml queries org project #2 itself, and its own `on:` block records
+    // that dispatching the private projection lane leaves this feed untouched.
+    // The assertion was pinning the bug in place, which is why it changes here
+    // rather than being deleted as an obstacle.
+    expect(targets(decide("projects_v2_item", "edited"))).toEqual([
+      ".github-private:board-changed",
+      "front-desk-feed:board-changed",
+    ]);
   });
 
-  test("every card lifecycle action counts", () => {
+  test("every card lifecycle action reaches both, not just `edited`", () => {
+    // `ok: true` was too weak to catch the missing target — it passed
+    // throughout the window where a card move reached the public feed through
+    // no path at all. Assert the fan-out per action instead.
     for (const action of ["created", "edited", "deleted", "reordered", "restored"]) {
-      expect(decide("projects_v2_item", action).ok).toBe(true);
+      expect(targets(decide("projects_v2_item", action))).toEqual([
+        ".github-private:board-changed",
+        "front-desk-feed:board-changed",
+      ]);
     }
   });
 
@@ -109,6 +122,29 @@ describe("projects_v2_item — the signal that reaches no other event", () => {
     // Widening must be a visible edit here, not something GitHub does for us by
     // adding an action to an event we already subscribe to.
     expect(decide("projects_v2_item", "archived_somehow").ok).toBe(false);
+  });
+});
+
+describe("front-desk-feed — the branch a reader actually looks at", () => {
+  test("every type this sender can send wakes the feed, none private-only", () => {
+    // Pinned across the whole DispatchType union rather than case by case,
+    // because the defect was never one wrong line — it was a type that quietly
+    // had one consumer fewer than the others. desk.bounded.tools renders the
+    // `feed` branch and now pushes on a board change, so a type that wakes only
+    // the private side puts a notification in front of a board that has not
+    // moved yet. A fourth type should fail here until someone has decided, in
+    // the open, whether the public feed needs it.
+    const woken = new Set<string>();
+    for (const [event, action] of [
+      ["pull_request", "opened"],
+      ["issues", "labeled"],
+      ["projects_v2_item", "edited"],
+    ] as const) {
+      const r = decide(event, action);
+      expect(r.ok).toBe(true);
+      if (r.ok) for (const t of r.targets) if (t.repo === "front-desk-feed") woken.add(t.eventType);
+    }
+    expect([...woken].sort()).toEqual(["board-changed", "claim-activity", "pr-activity"]);
   });
 });
 
