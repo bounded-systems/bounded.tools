@@ -11,13 +11,15 @@
 // share link into a toolpath Graph document the rest of the org's machinery
 // already understands.
 //
-// WHAT IT IS NOT. It does not upload anywhere. v1 RETURNS the Graph to the
-// caller; forwarding to the pathbase door stays a follow-up because a mobile
-// chat has no claim issue for the door's stamp, and the door's forced
-// `visibility` must not be bypassed by a second uploader beside it (#50 lists
-// both as out of scope). It also holds no vendor credential: the snapshot
-// endpoint answers for public shares only, so the relay can never reach a chat
-// its caller could not already read in a browser.
+// WHAT IT IS NOT. It is a converter, never an authority. Without a `claim` in
+// the body it RETURNS the Graph to the caller; with one it forwards the Graph
+// through the PATHBASE DOOR's claim tier (#59, closing the leg #50 deferred) —
+// and the door keeps every power it had: it verifies the claim live, forces
+// the `<repo>#<issue> <claimant>` stamp and `visibility: private`, enforces
+// its per-claim ceilings, and posts its own testimony. The relay holds no
+// vendor credential either way: the snapshot endpoint answers for public
+// shares only (the relay can never reach a chat its caller could not already
+// read in a browser), and the PATHBASE_PAT stays vaulted behind the door.
 //
 // THE THREE GATES, in order, each fail-closed (the github-door shape, #36):
 //   1. LEASE  — `Authorization: Bearer <token>` must match a named lease in
@@ -222,6 +224,32 @@ export function snapshotToGraph(snapshot: unknown, uuid: string): ConvertResult 
   };
 }
 
+// ── the door forward ─────────────────────────────────────────────────────────
+//
+// The same grammar the door's own parseDoorPath enforces (infra
+// cloudflare/pathbase-door): a plain repository name and a 1–10 digit issue.
+// Validated HERE too so a malformed claim is the caller's 400, not a
+// door-shaped 404 the caller has to decode.
+
+const CLAIM_REPO = /^[A-Za-z0-9._-]+$/;
+const CLAIM_ISSUE = /^[0-9]{1,10}$/;
+
+export type DoorClaim = { repo: string; issue: string };
+
+export function parseClaim(input: unknown): DoorClaim | null | "malformed" {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== "object" || Array.isArray(input)) return "malformed";
+  const c = input as Record<string, unknown>;
+  const repo = typeof c.repo === "string" ? c.repo.trim() : "";
+  const issue = typeof c.issue === "number" && Number.isInteger(c.issue) && c.issue > 0
+    ? String(c.issue)
+    : typeof c.issue === "string"
+      ? c.issue.trim()
+      : "";
+  if (!CLAIM_REPO.test(repo) || !CLAIM_ISSUE.test(issue)) return "malformed";
+  return { repo, issue };
+}
+
 // ── the handler ──────────────────────────────────────────────────────────────
 
 export type RelayDeps = {
@@ -234,6 +262,11 @@ export type RelayDeps = {
 // pinned here for the same reason it always was: a caller names a UUID, never
 // a URL to fetch.
 const SNAPSHOT_HOST = "https://claude.ai";
+
+// The pathbase door's public custom domain (infra cloudflare/pathbase-door) —
+// a literal for the same reason SNAPSHOT_HOST is: a caller names a claim,
+// never a URL to forward to.
+const DOOR_HOST = "https://pathbase.bounded.tools";
 
 export async function handleClaudeRelay(
   request: Request,
@@ -259,9 +292,11 @@ export async function handleClaudeRelay(
   }
 
   let uuid: string | null = null;
+  let claim: DoorClaim | null | "malformed" = null;
   try {
     const body = (await request.json()) as Record<string, unknown>;
     uuid = parseShareUrl(body?.share_url);
+    claim = parseClaim(body?.claim);
   } catch {
     // fall through to the 400 below — malformed JSON and a bad URL are the
     // same caller error.
@@ -269,6 +304,12 @@ export async function handleClaudeRelay(
   if (!uuid) {
     return new Response(
       'body must be JSON {"share_url": "https://claude.ai/share/<uuid>"}',
+      { status: 400 },
+    );
+  }
+  if (claim === "malformed") {
+    return new Response(
+      '"claim", when present, must be {"repo": "<plain repo name>", "issue": <number>}',
       { status: 400 },
     );
   }
@@ -312,8 +353,34 @@ export async function handleClaudeRelay(
     return new Response(`snapshot did not convert: ${converted.reason}`, { status: 422 });
   }
 
-  console.log(`[claude-relay] lease=${lease} chat=${uuid} steps=${converted.steps}`);
-  return new Response(JSON.stringify(converted.graph), {
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
-  });
+  if (!claim) {
+    console.log(`[claude-relay] lease=${lease} chat=${uuid} steps=${converted.steps}`);
+    return new Response(JSON.stringify(converted.graph), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
+
+  // The door keeps all of its own powers — live-claim gate, forced stamp and
+  // visibility, ceilings, testimony post-back — so its answer goes to the
+  // caller VERBATIM: a door refusal (unclaimed issue, rate ceiling, oversize)
+  // is caller-actionable and must not be blurred into a relay 502. Only the
+  // two door headers are relayed; everything else stays behind.
+  const doorResp = await fetchImpl(
+    `${DOOR_HOST}/c/${claim.repo}/${claim.issue}/api/v1/u/anon/repos/pathstash/graphs`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ document: converted.graph }),
+    },
+  );
+  const doorBody = await doorResp.text();
+  const headers = new Headers({ "cache-control": "no-store" });
+  for (const name of ["content-type", "x-door-claim", "x-door-postback"]) {
+    const value = doorResp.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  console.log(
+    `[claude-relay] lease=${lease} chat=${uuid} steps=${converted.steps} door=${claim.repo}#${claim.issue} -> ${doorResp.status}`,
+  );
+  return new Response(doorBody, { status: doorResp.status, headers });
 }
