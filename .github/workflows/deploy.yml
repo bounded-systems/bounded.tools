@@ -61,10 +61,49 @@ on:
           the broker's /apphook tier is live.
         type: boolean
         default: true
+      rotate_relay_lease:
+        description: >-
+          Rotate the Claude chat-session relay's lease (#53): generate a fresh
+          token inside the job, write `sessions:<token>` as the
+          CLAUDE_RELAY_LEASES Worker Secret under the same minted credential,
+          verify the relay's 503→401 flip on the live host, and print the token
+          ONLY age-encrypted to lease_recipient. Overwrites the whole lease
+          table (single-holder v1).
+        type: boolean
+        default: false
+      grant_relay_lease:
+        description: >-
+          Grant a per-session relay bearer (#62): a lease NAME
+          ([A-Za-z0-9._-]+, e.g. session-rqpjei). Writes `<name>:<token>` into
+          the name's HOME slot (CLAUDE_RELAY_LEASES_A/_B, hash of the name —
+          #68: no stored bookkeeping, and re-granting the same name refreshes
+          its own slot instead of evicting the neighbour). The standing line is
+          untouched. Token emitted ONLY age-encrypted to lease_recipient.
+        required: false
+        default: ""
+      grant_slot:
+        description: >-
+          Override the grant's home slot (A or B) — the escape hatch for two
+          names hashing to the same slot. Leave empty for the hash default.
+        required: false
+        default: ""
+      lease_recipient:
+        description: >-
+          EPHEMERAL age recipient (age1… or ssh-ed25519/ssh-rsa) for the
+          rotated or granted lease token — generate a throwaway keypair right
+          before dispatching, decrypt this run's output with it, then delete
+          it. Required with rotate_relay_lease or grant_relay_lease; validated
+          BEFORE anything is written.
+        required: false
+        default: ""
 
 permissions:
   id-token: write # OIDC -> broker /deploy/bounded-tools
   issues: write # the ceremony opens a notification issue carrying the approve URL
+  # actions:write is deliberately GONE (#68): it was added for `gh variable set`
+  # slot bookkeeping, which GITHUB_TOKEN cannot do here anyway (403 "Resource
+  # not accessible by integration", measured on run 33414469223) — slot choice
+  # is now derived from the grant name and needs no write at all.
 
 # One deploy at a time; never cancel a deploy already in flight.
 concurrency:
@@ -435,3 +474,147 @@ jobs:
           echo "::notice::Deployed and serving. The receiver still ingests nothing until"
           echo "::notice::GITHUB_WEBHOOK_SECRET is set as a Worker Secret and the App's"
           echo "::notice::hook URL points here — /ci.json will report coverage_complete: false."
+
+      # The relay lease, as lane-held custody (#53; the infra#294 direction —
+      # secrets ride gated lanes, never a laptop `wrangler secret put`). The
+      # token is generated HERE, masked, written under the same minted
+      # credential (a secret put IS a deploy — infra's `rotate` precedent), and
+      # leaves the job age-encrypted or not at all. Single-holder v1: the put
+      # overwrites the WHOLE lease table with one `sessions:<token>` line.
+      #
+      # AFTER the liveness probe on purpose: a deploy that failed verification
+      # must not write secrets, and the probe has already absorbed DNS/edge
+      # propagation so this step's own retries only cover secret-version
+      # rollout. The host is a literal for the same reason the keeper URL is —
+      # configuration must not be able to point the verify somewhere else.
+      - name: Rotate the Claude relay lease (age-encrypted hand-off)
+        if: ${{ inputs.rotate_relay_lease }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          RECIPIENT: ${{ inputs.lease_recipient }}
+          RELAY_BASE: https://hooks.bounded.tools
+        run: |
+          set -euo pipefail
+          # Guard the recipient's VALIDITY before writing, not just its
+          # presence: a malformed recipient that fails only at encryption time
+          # strands a live lease nobody can read — the exact state
+          # rotate-lease-key.yml's probe exists to prevent.
+          [ -n "${RECIPIENT:-}" ] || { echo "::error::rotate_relay_lease needs lease_recipient (an ephemeral age recipient) — nothing was written"; exit 1; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          printf 'probe' | age -r "$RECIPIENT" -a >/dev/null 2>&1 || {
+            echo "::error::age rejected the recipient — NOTHING was written, the lease is untouched."
+            echo "::error::  expected an age1… public key or an ssh-ed25519/ssh-rsa public key line"
+            echo "::error::  note: age does NOT support FIDO/sk-ssh-* keys as recipients"
+            exit 1
+          }
+
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          printf 'sessions:%s' "$token" | bun x wrangler secret put CLAUDE_RELAY_LEASES
+
+          # Verify with the relay's own status discriminators, on the live
+          # host. THE RETRIES BELONG ON THE NEW-TOKEN CHECK (#71 finding 1):
+          # the garbage-bearer 401 is vacuously satisfied by any pre-existing
+          # lease, so it senses nothing about THIS write — it stays as a
+          # one-shot sanity probe (it still catches the from-nothing case,
+          # where a lingering 503 means the write failed outright). What
+          # senses secret-version rollout is the NEW token flipping 401→400
+          # (authenticated past the lease gate on a malformed body — nothing
+          # fetched, nothing spent), so that check carries the 12 retries,
+          # exactly as the grant step below always did (and needed: run
+          # 33414469223 measured attempt 1 answering 401).
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
+            -H 'authorization: Bearer garbage-bearer-000000000000' \
+            -H 'content-type: application/json' -d '{}' || true)"
+          [ "$code" = "401" ] || echo "  garbage-bearer probe answered '${code:-none}' — informational; the new-token check below is authoritative"
+          ok=""
+          for attempt in $(seq 1 12); do
+            ok="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
+              -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' || true)"
+            [ "$ok" = "400" ] && break
+            echo "  … attempt $attempt: new token answered '${ok:-none}' (want 400) — retrying in 10s"
+            sleep 10
+          done
+          [ "$ok" = "400" ] || { echo "::error::the NEW token answered ${ok:-nothing} to a malformed body (want 400) — refusing to hand off a token that does not authenticate"; exit 1; }
+          echo "✓ lease armed: the new token authenticates (lease name: sessions)"
+
+          echo "==== relay lease token — the Authorization bearer for /claude/sessions ======"
+          echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
+          printf '%s' "$token" | age -r "$RECIPIENT" -a
+
+      # A per-session grant (#62): same custody as the rotate step above, into
+      # a SLOT instead of the standing line. Worker Secrets are write-only, so
+      # multi-holder is a bounded ring. Which slot is the name's own HASH
+      # (#68): GITHUB_TOKEN cannot write repo variables (403, measured), and
+      # the home-slot rule is better anyway — re-granting a name refreshes its
+      # own bearer instead of evicting the neighbour, and two names colliding
+      # on one slot have the grant_slot override.
+      - name: Grant a per-session relay lease (age-encrypted hand-off)
+        if: ${{ inputs.grant_relay_lease != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          RECIPIENT: ${{ inputs.lease_recipient }}
+          GRANT_NAME: ${{ inputs.grant_relay_lease }}
+          GRANT_SLOT: ${{ inputs.grant_slot }}
+          RELAY_BASE: https://hooks.bounded.tools
+        run: |
+          set -euo pipefail
+          # The lease-table grammar is names-colon-tokens; a name that cannot
+          # appear in it must fail before anything is written, like the
+          # recipient below.
+          printf '%s' "$GRANT_NAME" | grep -Eq '^[A-Za-z0-9._-]+$' || {
+            echo "::error::grant_relay_lease must match [A-Za-z0-9._-]+ — nothing was written"; exit 1; }
+          # "sessions" is the standing line's name (the rotate step writes it,
+          # hardcoded above). The worker resolves duplicate names standing-
+          # first, so a grant reusing it could never authenticate — refuse it
+          # here with the reason, instead of handing off a dead token (#71
+          # finding 3's lane half).
+          [ "$GRANT_NAME" != "sessions" ] || {
+            echo "::error::grant_relay_lease must not reuse the standing lease name 'sessions' — nothing was written"; exit 1; }
+          [ -n "${RECIPIENT:-}" ] || { echo "::error::grant_relay_lease needs lease_recipient (an ephemeral age recipient) — nothing was written"; exit 1; }
+          command -v age >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq age; }
+          printf 'probe' | age -r "$RECIPIENT" -a >/dev/null 2>&1 || {
+            echo "::error::age rejected the recipient — NOTHING was written, the slots are untouched."
+            exit 1
+          }
+
+          # The name's home slot, or the explicit override. cksum, not a
+          # cryptographic hash: this is a bucket choice, not a security
+          # property, and cksum is POSIX-everywhere.
+          case "${GRANT_SLOT:-}" in
+            A|B) slot="$GRANT_SLOT" ;;
+            "")
+              n="$(printf '%s' "$GRANT_NAME" | cksum | cut -d' ' -f1)"
+              if [ $((n % 2)) -eq 0 ]; then slot=A; else slot=B; fi
+              ;;
+            *) echo "::error::grant_slot must be A, B, or empty (got '$GRANT_SLOT') — nothing was written"; exit 1 ;;
+          esac
+
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          printf '%s:%s' "$GRANT_NAME" "$token" | bun x wrangler secret put "CLAUDE_RELAY_LEASES_$slot"
+
+          # The new token must authenticate before it is handed off: 400 on a
+          # malformed body = past the lease gate, nothing fetched. Bounded
+          # retries absorb secret-version rollout. (No 503/401 discriminator
+          # here — the standing line keeps the relay armed throughout.)
+          ok=""
+          for attempt in $(seq 1 12); do
+            ok="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$RELAY_BASE/claude/sessions" \
+              -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' || true)"
+            [ "$ok" = "400" ] && break
+            echo "  … attempt $attempt: new token answered '${ok:-none}' (want 400) — retrying in 10s"
+            sleep 10
+          done
+          [ "$ok" = "400" ] || { echo "::error::the granted token answered ${ok:-nothing} (want 400) — refusing to hand off a token that does not authenticate"; exit 1; }
+          echo "✓ grant '$GRANT_NAME' written to slot $slot and verified live"
+
+          # EMIT BEFORE THE BOOKKEEPING (#65). The failure modes are not
+          # symmetric: a delivered token with stale bookkeeping costs one early
+          # displacement on the next grant; stale bookkeeping with an
+          # undelivered token costs the whole grant and leaves live key
+          # material nobody holds — which is exactly how the first grant run
+          # ended when `gh` failed after the write.
+          echo "==== granted relay lease token ($GRANT_NAME, slot $slot) ===================="
+          echo "==== decrypt: age -d -i <your ephemeral identity>                        ===="
+          printf '%s' "$token" | age -r "$RECIPIENT" -a
