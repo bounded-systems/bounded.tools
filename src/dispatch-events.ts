@@ -24,7 +24,21 @@
  *  `publish.yml`, and have simply never been sent. `board-changed` was the one
  *  addition, for ProjectV2 edits, which no receiver could observe before; both
  *  receivers declare it now. */
-export type DispatchType = "pr-activity" | "claim-activity" | "board-changed";
+export type DispatchType =
+  | "pr-activity"
+  | "claim-activity"
+  | "board-changed"
+  // Per-lane keeper approvals (`.github-private`#847). Enumerated rather than
+  // widened to a template literal: the union being CLOSED is what stops a
+  // caller naming an event type, and `keeper-approval-${string}` would give
+  // that away to save six lines. Must stay in step with ALLOWED_WORKFLOWS in
+  // keeper-approval.ts -- a test pins that they match.
+  | "keeper-approval-front-desk-reroll"
+  | "keeper-approval-adopt-claude-harness"
+  | "keeper-approval-merge-claude-harness"
+  | "keeper-approval-reroll-claude-harness"
+  | "keeper-approval-org-baseline"
+  | "keeper-approval-org-sync";
 
 export type DispatchTarget = { owner: string; repo: string; eventType: DispatchType };
 
@@ -37,7 +51,7 @@ export type SkipReason =
   | "action-not-watched"
   | "no-action";
 
-const OWNER = "bounded-systems";
+export const OWNER = "bounded-systems";
 
 // WHICH ACTIONS. Narrow on purpose: an action not named here cannot wake a
 // projection, so widening is a visible edit rather than a side effect of

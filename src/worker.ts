@@ -17,12 +17,17 @@ import { adaptWorkflowRun, type WorkflowRunPayload } from "./github-events";
 import { handleClaudeRelay } from "./claude-relay";
 import { handleGithubDoor } from "./github-door";
 import { listInstallationRepos } from "./reconcile";
-import { decide, dispatch } from "./dispatch-events";
+import { decide, dispatch, OWNER } from "./dispatch-events";
+import { decideKeeperDispatch, verifyNotice } from "./keeper-approval";
 
 export { CiStateDO };
 
 export type Env = {
   GITHUB_WEBHOOK_SECRET?: string;
+  /** Shared secret with the keeper's approval notice (`.github-private`#847).
+   *  Absent ⇒ /api/keeper/approved answers 503 and dispatches NOTHING; it must
+   *  never be read as "no signature required". `wrangler secret put`. */
+  KEEPER_NOTIFY_SECRET?: string;
   /** Named bearer leases for the read-only GitHub door (src/github-door.ts),
    *  `name:token` per line. Worker secret. Absent ⇒ the door refuses all. */
   DOOR_LEASES?: string;
@@ -337,6 +342,89 @@ ever holds the PEM.</p></body>`;
       else await work;
 
       return new Response("ok");
+    }
+
+    // ── the keeper says a Face ID landed ────────────────────────────────────
+    //
+    // Wakes ONE gated lane so it can redeem and do its work, instead of that
+    // lane holding a runner open while a human decides (`.github-private`#847).
+    //
+    // THIS ROUTE CAN WAKE A LANE THAT HOLDS A WRITE-SCOPED CREDENTIAL. Every
+    // gate below runs BEFORE any mint or any GitHub call, and the order is
+    // pinned by keeper-approval.test.ts -- "we authenticated it" is worth
+    // nothing if a mint happened first.
+    if (url.pathname === "/api/keeper/approved") {
+      // Explicit, not inherited: the neighbouring webhook route folds method
+      // into its path match, and a route that answered GET here would leak its
+      // decisions to anyone who could guess the path.
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+
+      // Read as TEXT and verify BEFORE parsing -- the same order the webhook
+      // route uses. Parsing first would run a parser over unauthenticated bytes.
+      const raw = await request.text();
+      const verified = await verifyNotice(
+        env.KEEPER_NOTIFY_SECRET,
+        raw,
+        request.headers.get("x-keeper-timestamp"),
+        request.headers.get("x-keeper-signature-256"),
+        Date.now(),
+      );
+      if (!verified.ok) {
+        // 503 (unconfigured) stays distinguishable from 401 (bad signature),
+        // the same way the door's empty-lease refusal does.
+        console.error(`[keeper-approval] refused: ${verified.reason}`);
+        return new Response(verified.reason, { status: verified.status });
+      }
+
+      let notice: unknown;
+      try {
+        notice = JSON.parse(raw);
+      } catch {
+        return new Response("malformed json", { status: 400 });
+      }
+      const decision = decideKeeperDispatch(notice as Parameters<typeof decideKeeperDispatch>[0]);
+      if (!decision.ok) {
+        console.error(`[keeper-approval] ${decision.reason}`);
+        return new Response(decision.reason, { status: decision.status });
+      }
+
+      // REPLAY REFUSAL. The signature window is +/-300 s, which alone would let
+      // a captured notice fire duplicate wake-ups for five minutes. Duplicates
+      // are harmless downstream -- the keeper's grant is single-use, so the
+      // second run B redeems nothing -- but a route should not lean on someone
+      // else's single-use for something a nonce settles here.
+      const seen = await ci(env).fetch("https://ci/keeper-seen", {
+        method: "POST",
+        body: JSON.stringify({ ceremonyId: decision.ceremonyId }),
+      });
+      if (seen.status === 409) {
+        console.log(`[keeper-approval] duplicate ceremony ${decision.ceremonyId}, no dispatch`);
+        return new Response("already dispatched", { status: 409 });
+      }
+
+      const app = env.DISPATCH_APP ?? "bs-door-dispatch";
+      const mint = await env.BROKER.fetch(`https://binding.internal/apptoken/${app}`, { method: "POST" });
+      if (!mint.ok) {
+        console.error(`[keeper-approval] broker refused to mint for ${app} (${mint.status})`);
+        return new Response("mint failed", { status: 502 });
+      }
+      const { token } = (await mint.json()) as { token?: string };
+      if (!token) return new Response("mint returned no token", { status: 502 });
+
+      const out = await dispatch(
+        { owner: OWNER, repo: decision.repo, eventType: decision.eventType },
+        token,
+      );
+      // REAL STATUS CODES, unlike the webhook route beside this one. That route
+      // must always 200 because GitHub disables webhooks that fail; this
+      // route's caller is the keeper, which SHOULD see a failure so it can
+      // retry. Do not "fix" this to match its neighbour.
+      if (!out.ok) {
+        console.error(`[keeper-approval] dispatch FAILED ${decision.repo} <- ${decision.eventType} (${out.status})`);
+        return new Response("dispatch failed", { status: 502 });
+      }
+      console.log(`[keeper-approval] ${decision.repo} <- ${decision.eventType}`);
+      return new Response("dispatched");
     }
 
     return new Response("not found", { status: 404 });

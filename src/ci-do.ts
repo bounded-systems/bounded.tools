@@ -38,6 +38,32 @@ export class CiStateDO {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // CLAIM A CEREMONY ID, ONCE. The keeper-approval route's replay refusal
+    // (`.github-private`#847): its signature window is ±300 s, which alone
+    // would let a captured notice fire duplicate wake-ups for five minutes.
+    //
+    // Correct BECAUSE the DO serializes: get-then-put is only atomic here, and
+    // the whole value of this endpoint is that two concurrent notices for one
+    // ceremony cannot both see "absent". A KV would race.
+    //
+    // Answers 409 for a repeat, 200 for a first claim -- and NOTHING ELSE, so a
+    // caller that treats "not 409" as "go ahead" is right. A 404 from a missing
+    // route would have meant this check silently passed everything, which is the
+    // failure this endpoint exists to make impossible.
+    if (url.pathname === "/keeper-seen" && request.method === "POST") {
+      const { ceremonyId } = (await request.json()) as { ceremonyId?: string };
+      if (typeof ceremonyId !== "string" || ceremonyId.length === 0) {
+        return new Response("missing ceremonyId", { status: 400 });
+      }
+      const key = `keeper-seen:${ceremonyId}`;
+      if (await this.state.storage.get(key)) return new Response("duplicate", { status: 409 });
+      // A ceremony id is spent once and never reused, so this only ever grows
+      // by one row per approval. Expiry is not needed for correctness; if the
+      // row count ever matters, delete by age rather than weakening the check.
+      await this.state.storage.put(key, Date.now());
+      return new Response("claimed");
+    }
+
     // Ingest one observation. The load → apply → put sequence is only safe
     // because the DO serializes it; that is the point of this class.
     if (url.pathname === "/observe" && request.method === "POST") {
