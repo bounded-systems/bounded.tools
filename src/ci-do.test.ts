@@ -166,3 +166,40 @@ describe("CiStateDO", () => {
     expect((await obj.fetch(new Request("https://ci/observe"))).status).toBe(404);
   });
 });
+
+// ── the keeper-approval replay guard (.github-private#847) ──────────────────
+// The route's signature window is ±300 s, which alone would let a captured
+// notice fire duplicate wake-ups for five minutes. This endpoint is what makes
+// a ceremony id spendable exactly once.
+
+const seen = (obj: CiStateDO, ceremonyId: unknown) =>
+  obj.fetch(new Request("https://ci/keeper-seen", { method: "POST", body: JSON.stringify({ ceremonyId }) }));
+
+test("a ceremony id can be claimed once, and the second claim is 409", async () => {
+  const { obj } = doFor();
+  expect((await seen(obj, "cer-abcdefgh")).status).toBe(200);
+  expect((await seen(obj, "cer-abcdefgh")).status).toBe(409);
+});
+
+test("distinct ceremony ids do not collide", async () => {
+  const { obj } = doFor();
+  for (const id of ["cer-one", "cer-two", "cer-three"]) {
+    expect((await seen(obj, id)).status).toBe(200);
+  }
+});
+
+test("a missing or malformed ceremonyId is 400 — never a silent pass", async () => {
+  const { obj } = doFor();
+  for (const bad of [undefined, "", 42, null]) {
+    expect((await seen(obj, bad)).status).toBe(400);
+  }
+});
+
+test("the route EXISTS — a 404 here would mean the replay check passes everything", async () => {
+  // The defect this pins is the one that nearly shipped: worker.ts treats
+  // "not 409" as "not seen", so a MISSING route would have silently disabled
+  // the guard rather than failing loudly. Asserting the status is not 404 is
+  // asserting that the endpoint the route depends on is actually wired.
+  const { obj } = doFor();
+  expect((await seen(obj, "cer-x1234567")).status).not.toBe(404);
+});
